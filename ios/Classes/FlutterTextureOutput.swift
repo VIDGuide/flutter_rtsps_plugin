@@ -1,0 +1,94 @@
+import Flutter
+import Foundation
+import os.log
+
+// MARK: - FlutterTextureOutput
+
+/// Delivers decoded `CVPixelBuffer` frames to Flutter via `FlutterTextureRegistry`.
+///
+/// Usage:
+/// 1. Create with `init(textureRegistry:)` — registers self and stores `textureId`.
+/// 2. Pass `onNewFrame(_:)` as the `onPixelBuffer` callback to `H264Decoder`.
+/// 3. Call `stop()` when the stream ends to unregister the texture.
+///
+/// Thread safety: `latestPixelBuffer` is protected by `NSLock`. `copyPixelBuffer()`
+/// may be called from Flutter's render thread; `onNewFrame(_:)` is called from the
+/// VideoToolbox decoder queue.
+///
+/// Requirements: 5.1, 5.2, 5.4, 5.5, 5.6
+final class FlutterTextureOutput: NSObject, FlutterTexture {
+
+    // MARK: - Public
+
+    /// The texture ID assigned by Flutter's `TextureRegistry`. (Req 5.1, 5.3)
+    private(set) var textureId: Int64 = 0
+
+    // MARK: - Private
+
+    private weak var textureRegistry: FlutterTextureRegistry?
+    private var latestPixelBuffer: CVPixelBuffer?
+    private let lock = NSLock()
+    private let log = OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin",
+                            category: "FlutterTextureOutput")
+
+    // MARK: - Init
+
+    /// Registers this texture with the Flutter `TextureRegistry` and stores the
+    /// returned `textureId`. (Req 5.1)
+    ///
+    /// - Parameter textureRegistry: The Flutter texture registry obtained from
+    ///   the plugin registrar. Stored weakly to avoid retain cycles.
+    init(textureRegistry: FlutterTextureRegistry) {
+        self.textureRegistry = textureRegistry
+        super.init()
+        // Register self after super.init() so `self` is fully initialised.
+        self.textureId = textureRegistry.register(self)
+        os_log("FlutterTextureOutput: registered texture %lld", log: log, type: .info, textureId)
+    }
+
+    // MARK: - FlutterTexture
+
+    /// Returns the most recently decoded `CVPixelBuffer` to Flutter's render thread.
+    /// Uses a lock-protected swap so the render thread always gets the latest frame.
+    /// (Req 5.2)
+    func copyPixelBuffer() -> Unmanaged<CVPixelBuffer>? {
+        lock.lock()
+        let buffer = latestPixelBuffer
+        lock.unlock()
+        guard let buffer else { return nil }
+        return Unmanaged.passRetained(buffer)
+    }
+
+    // MARK: - New Frame
+
+    /// Called by `H264Decoder`'s `onPixelBuffer` callback when a decoded frame
+    /// is ready. Stores the buffer and notifies Flutter on the main thread. (Req 5.2, 5.5)
+    func onNewFrame(_ pixelBuffer: CVPixelBuffer) {
+        lock.lock()
+        latestPixelBuffer = pixelBuffer
+        lock.unlock()
+
+        // textureFrameAvailable MUST be called on the main thread (Req 5.5)
+        let id = textureId
+        let registry = textureRegistry
+        if Thread.isMainThread {
+            registry?.textureFrameAvailable(id)
+        } else {
+            DispatchQueue.main.async {
+                registry?.textureFrameAvailable(id)
+            }
+        }
+    }
+
+    // MARK: - Stop
+
+    /// Unregisters the texture from Flutter's `TextureRegistry` to release GPU
+    /// memory. (Req 5.4)
+    func stop() {
+        textureRegistry?.unregisterTexture(textureId)
+        lock.lock()
+        latestPixelBuffer = nil
+        lock.unlock()
+        os_log("FlutterTextureOutput: texture %lld unregistered", log: log, type: .info, textureId)
+    }
+}
