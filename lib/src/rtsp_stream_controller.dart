@@ -123,6 +123,9 @@ class RtspStreamController {
         final code = _parseErrorCode(raw['code'] as String?);
         final message = (raw['message'] as String?) ?? 'Unknown error';
         return RtspErrorEvent(RtspException(code: code, message: message));
+      case 'frame':
+        final ts = (raw['ts'] as num?)?.toInt() ?? 0;
+        return RtspFrameEvent(timestampMs: ts);
       default:
         return const RtspStoppedEvent();
     }

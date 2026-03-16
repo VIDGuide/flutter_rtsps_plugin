@@ -21,3 +21,10 @@ final class RtspErrorEvent extends RtspStreamEvent {
 final class RtspStoppedEvent extends RtspStreamEvent {
   const RtspStoppedEvent();
 }
+
+/// A video frame was decoded. Emitted for every frame after the first.
+final class RtspFrameEvent extends RtspStreamEvent {
+  const RtspFrameEvent({required this.timestampMs});
+  /// Milliseconds since epoch when the frame was decoded.
+  final int timestampMs;
+}

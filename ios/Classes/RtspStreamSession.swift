@@ -208,12 +208,17 @@ final class RtspStreamSession: NSObject {
 
     // MARK: - Private — first frame
 
-    /// Called on every decoded frame; emits `RtspPlayingEvent` exactly once.
+    /// Called on every decoded frame; emits `RtspPlayingEvent` exactly once,
+    /// then emits a `frame` timestamp event for every subsequent frame.
     private func onNewFrame() {
         stateQueue.async { [weak self] in
-            guard let self, !self.firstFrameEmitted, !self.stopped else { return }
-            self.firstFrameEmitted = true
-            self.emitEvent(["type": "playing", "textureId": Int(self.textureOutput?.textureId ?? 0)])
+            guard let self, !self.stopped else { return }
+            if !self.firstFrameEmitted {
+                self.firstFrameEmitted = true
+                self.emitEvent(["type": "playing", "textureId": Int(self.textureOutput?.textureId ?? 0)])
+            } else {
+                self.emitEvent(["type": "frame", "ts": Int(Date().timeIntervalSince1970 * 1000)])
+            }
         }
     }
 
