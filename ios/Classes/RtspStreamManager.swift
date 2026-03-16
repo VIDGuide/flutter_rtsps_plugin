@@ -133,6 +133,26 @@ class RtspStreamManager {
         }
     }
 
+    func captureFrameFromStream(streamId: Int, result: @escaping FlutterResult) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard let session = self.sessions[streamId] else {
+                DispatchQueue.main.async {
+                    result(FlutterError(code: "connectionFailed", message: "No active stream for streamId \(streamId)", details: nil))
+                }
+                return
+            }
+            if let jpegData = session.captureFrame() {
+                let typedData = FlutterStandardTypedData(bytes: jpegData)
+                DispatchQueue.main.async { result(typedData) }
+            } else {
+                DispatchQueue.main.async {
+                    result(FlutterError(code: "connectionFailed", message: "No frame available yet", details: nil))
+                }
+            }
+        }
+    }
+
     func dispose(result: @escaping FlutterResult) {
         queue.async { [weak self] in
             guard let self else { return }

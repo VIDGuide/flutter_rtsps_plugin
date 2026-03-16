@@ -62,8 +62,19 @@ final class H264Decoder {
     /// Creates `CMVideoFormatDescription` and `VTDecompressionSession` from
     /// the provided SPS and PPS parameter sets. (Req 4.1)
     ///
+    /// Must be called before `feedNalUnit` starts being invoked (i.e. before
+    /// the demuxer is started). After that point, all state mutations happen
+    /// on `queue` via `feedNalUnit`'s async dispatch.
+    ///
     /// - Throws: `RtspError.decoderError` if VideoToolbox initialization fails.
     func initializeDecoder(sps: Data, pps: Data) throws {
+        // Called from RtspStreamSession.start() before the demuxer is running,
+        // so no concurrent feedNalUnit calls exist yet — run inline, no dispatch needed.
+        try initializeDecoderSync(sps: sps, pps: pps)
+    }
+
+    /// Internal implementation — must be called on `queue`.
+    private func initializeDecoderSync(sps: Data, pps: Data) throws {
         // Build the format description from SPS + PPS
         var spsBytes = [UInt8](sps)
         var ppsBytes = [UInt8](pps)
@@ -177,7 +188,7 @@ final class H264Decoder {
 
     /// Builds a `CMSampleBuffer` in AVCC format and submits it to the
     /// `VTDecompressionSession`. (Req 4.2)
-    func decodeNalUnits(_ nalUnits: [Data]) {
+    private func decodeNalUnits(_ nalUnits: [Data]) {
         guard let session = decompressionSession,
               let formatDesc = formatDescription,
               !nalUnits.isEmpty else { return }
@@ -193,25 +204,46 @@ final class H264Decoder {
             avccData.append(contentsOf: nal)
         }
 
-        // Create CMBlockBuffer from the AVCC data
+        // Create CMBlockBuffer — use CMBlockBufferCreateWithMemoryBlock with the
+        // default allocator (nil) so CoreMedia *copies* the data into its own
+        // allocation. Using kCFAllocatorNull here would hand CoreMedia a pointer
+        // into our local `avccData` without copying it; since we use
+        // _EnableAsynchronousDecompression the local Data goes out of scope
+        // before VideoToolbox finishes reading it, causing a use-after-free and
+        // corrupted frames.
         let avccLength = avccData.count
         var blockBuffer: CMBlockBuffer?
-        let blockStatus = avccData.withUnsafeMutableBytes { ptr in
-            CMBlockBufferCreateWithMemoryBlock(
+        let blockStatus: OSStatus = avccData.withUnsafeBytes { src in
+            // CMBlockBufferCreateWithMemoryBlock with a nil blockAllocator copies
+            // the bytes into a new CoreMedia-managed allocation.
+            var copied: CMBlockBuffer?
+            let s = CMBlockBufferCreateWithMemoryBlock(
                 allocator: nil,
-                memoryBlock: ptr.baseAddress,
+                memoryBlock: nil,          // let CoreMedia allocate
                 blockLength: avccLength,
-                blockAllocator: kCFAllocatorNull,
+                blockAllocator: nil,       // CoreMedia owns the memory
                 customBlockSource: nil,
                 offsetToData: 0,
                 dataLength: avccLength,
                 flags: 0,
-                blockBufferOut: &blockBuffer
+                blockBufferOut: &copied
             )
+            guard s == kCMBlockBufferNoErr, let dst = copied else { return s }
+            // Copy our bytes into the CoreMedia-owned block
+            let replaceStatus = CMBlockBufferReplaceDataBytes(
+                with: src.baseAddress!,
+                blockBuffer: dst,
+                offsetIntoDestination: 0,
+                dataLength: avccLength
+            )
+            if replaceStatus == kCMBlockBufferNoErr {
+                blockBuffer = dst
+            }
+            return replaceStatus
         }
 
         guard blockStatus == kCMBlockBufferNoErr, let block = blockBuffer else {
-            os_log("H264Decoder: CMBlockBufferCreateWithMemoryBlock failed: %d",
+            os_log("H264Decoder: CMBlockBuffer creation failed: %d",
                    log: log, type: .error, blockStatus)
             return  // Per-frame error: discard and continue (Req 4.5)
         }
@@ -272,17 +304,26 @@ final class H264Decoder {
         }
         formatDescription = nil
         isInitialized = false
+        pendingNalUnits = []
     }
 
-    /// Attempts to initialize the decoder once both in-band SPS and PPS have
-    /// been received. (Req 4.7)
+    /// Initializes (or re-initializes) the decoder once both in-band SPS and
+    /// PPS have been received.
+    ///
+    /// Re-initialization is intentionally allowed: mid-stream SPS/PPS changes
+    /// (e.g. resolution or bitrate switch at a keyframe boundary) must cause a
+    /// decoder reset. Continuing with stale parameter sets produces corrupted
+    /// frames. Pending NAL units from the previous parameter set are flushed
+    /// before teardown since they cannot be decoded with the new format
+    /// description. (Req 4.7)
     private func tryInitializeFromInBand() {
-        guard !isInitialized,
-              let sps = inBandSps,
-              let pps = inBandPps else { return }
+        guard let sps = inBandSps, let pps = inBandPps else { return }
+
+        // Discard any picture NALs that were queued under the old parameter sets.
+        pendingNalUnits = []
 
         do {
-            try initializeDecoder(sps: sps, pps: pps)
+            try initializeDecoderSync(sps: sps, pps: pps)
             inBandSps = nil
             inBandPps = nil
         } catch {

@@ -136,6 +136,12 @@ All errors are thrown as `RtspException` with a typed `code`:
 | `decoderError` | VideoToolbox failed to initialise |
 | `tooManyStreams` | 8 concurrent streams already active |
 
+## Support
+
+If this plugin saves you some time, a coffee is always appreciated!
+
+[![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow?logo=buy-me-a-coffee)](https://www.buymeacoffee.com/misaunders)
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

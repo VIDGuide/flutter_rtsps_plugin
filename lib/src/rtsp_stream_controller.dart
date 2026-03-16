@@ -58,6 +58,25 @@ class RtspStreamController {
     }
   }
 
+  /// Captures a JPEG frame from an already-running stream session.
+  ///
+  /// This grabs the most recently decoded frame from the existing session
+  /// without opening a new RTSP connection. Returns `null` if no frame has
+  /// been decoded yet.
+  ///
+  /// Throws [RtspException] if the streamId is unknown or the platform call fails.
+  Future<Uint8List?> captureFrameFromStream(int streamId) async {
+    try {
+      final result = await _methodChannel.invokeMethod<Uint8List>(
+        'captureFrameFromStream',
+        {'streamId': streamId},
+      );
+      return result;
+    } on PlatformException catch (e) {
+      throw _convertPlatformException(e);
+    }
+  }
+
   /// Captures a single JPEG frame from the given RTSP URL.
   ///
   /// [timeoutSeconds] must be between 1 and 60 (inclusive).
@@ -93,7 +112,7 @@ class RtspStreamController {
     final eventChannel = EventChannel(
       'flutter_rtsps_plugin/events/$streamId',
     );
-    return eventChannel.receiveBroadcastStream().map(_mapEvent);
+    return eventChannel.receiveBroadcastStream().expand(_mapEvents);
   }
 
   /// Stops all active streams and releases all plugin resources.
@@ -109,26 +128,34 @@ class RtspStreamController {
   // Private helpers
   // ---------------------------------------------------------------------------
 
-  RtspStreamEvent _mapEvent(dynamic raw) {
+  /// Maps a raw event map from the native side to [RtspStreamEvent]s.
+  ///
+  /// Yields an iterable so that a single native event can produce multiple
+  /// Dart events (e.g. `playing` also emits a `RtspFrameEvent` for the first
+  /// frame so FpsOverlay counts it).
+  Iterable<RtspStreamEvent> _mapEvents(dynamic raw) sync* {
     if (raw is! Map) {
-      return const RtspStoppedEvent();
+      yield const RtspStoppedEvent();
+      return;
     }
     final type = raw['type'] as String?;
-    switch (type) {
-      case 'playing':
-        return const RtspPlayingEvent();
-      case 'stopped':
-        return const RtspStoppedEvent();
-      case 'error':
-        final code = _parseErrorCode(raw['code'] as String?);
-        final message = (raw['message'] as String?) ?? 'Unknown error';
-        return RtspErrorEvent(RtspException(code: code, message: message));
-      case 'frame':
-        final ts = (raw['ts'] as num?)?.toInt() ?? 0;
-        return RtspFrameEvent(timestampMs: ts);
-      default:
-        return const RtspStoppedEvent();
+    if (type == 'playing') {
+      yield const RtspPlayingEvent();
+      // Native side includes `ts` on the playing event so FpsOverlay counts
+      // the very first frame.
+      final ts = (raw['ts'] as num?)?.toInt();
+      if (ts != null) yield RtspFrameEvent(timestampMs: ts);
+    } else if (type == 'frame') {
+      final ts = (raw['ts'] as num?)?.toInt() ?? 0;
+      yield RtspFrameEvent(timestampMs: ts);
+    } else if (type == 'error') {
+      final code = _parseErrorCode(raw['code'] as String?);
+      final message = (raw['message'] as String?) ?? 'Unknown error';
+      yield RtspErrorEvent(RtspException(code: code, message: message));
+    } else if (type == 'stopped') {
+      yield const RtspStoppedEvent();
     }
+    // Unknown event types are silently dropped — no yield means no event.
   }
 
   RtspException _convertPlatformException(PlatformException e) {

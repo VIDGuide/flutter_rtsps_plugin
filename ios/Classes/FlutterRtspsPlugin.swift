@@ -48,6 +48,13 @@ public class FlutterRtspsPlugin: NSObject, FlutterPlugin {
             }
             manager.stopStream(streamId: streamId, result: result)
 
+        case "captureFrameFromStream":
+            guard let streamId = args?["streamId"] as? Int else {
+                result(FlutterError(code: "connectionFailed", message: "Missing streamId", details: nil))
+                return
+            }
+            manager.captureFrameFromStream(streamId: streamId, result: result)
+
         case "captureSnapshot":
             guard
                 let url = args?["url"] as? String,

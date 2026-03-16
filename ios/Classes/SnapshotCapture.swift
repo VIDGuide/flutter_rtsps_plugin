@@ -15,6 +15,9 @@ final class SnapshotCapture {
 
     private let log = OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin", category: "SnapshotCapture")
 
+    /// Shared CIContext — expensive to create, reused across encode calls.
+    private static let ciContext = CIContext()
+
     // MARK: - Public API
 
     /// Connects, decodes the first frame, encodes it as JPEG, and disconnects.
@@ -131,9 +134,8 @@ final class SnapshotCapture {
         // Encode CVPixelBuffer → JPEG (Req 6.2)
         let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
         let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let context = CIContext()
 
-        guard let jpegData = context.jpegRepresentation(of: ciImage, colorSpace: colorSpace) else {
+        guard let jpegData = SnapshotCapture.ciContext.jpegRepresentation(of: ciImage, colorSpace: colorSpace) else {
             throw RtspError.decoderError
         }
 

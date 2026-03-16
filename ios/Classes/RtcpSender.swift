@@ -32,6 +32,9 @@ final class RtcpSender {
     private var timer: DispatchSourceTimer?
     private let timerQueue = DispatchQueue(label: "com.pandawatch.flutter_rtsps_plugin.rtcp")
 
+    /// Guards against overlapping sends if a send takes longer than the 1-second interval.
+    private var isSending = false
+
     /// Most recent RTP statistics snapshot, updated by `updateStats(_:)`.
     private var stats = RtpStats(ssrc: 0, highestSeq: 0, packetCount: 0, octetCount: 0)
 
@@ -83,6 +86,13 @@ final class RtcpSender {
     /// Builds an RTCP Receiver Report packet, wraps it in a TCP interleaved
     /// frame, and writes it via the transport.
     private func sendReceiverReport() {
+        // Skip this tick if a previous send is still in flight
+        guard !isSending else {
+            os_log("RtcpSender: previous send still in flight, skipping tick", log: log, type: .debug)
+            return
+        }
+        isSending = true
+
         let rtcpPacket = buildReceiverReport(stats: stats)
         let frame = wrapInInterleavedFrame(channel: 1, payload: rtcpPacket)
 
@@ -90,6 +100,9 @@ final class RtcpSender {
             guard let self else { return }
             do {
                 try await self.transport.send(data: frame)
+                // Clear the flag back on timerQueue to stay on the same executor
+                // that set it, avoiding any ordering ambiguity.
+                self.timerQueue.async { self.isSending = false }
                 os_log("RtcpSender: sent RR (ssrc=%u, seq=%u)",
                        log: self.log, type: .debug,
                        self.stats.ssrc, self.stats.highestSeq)
@@ -98,6 +111,7 @@ final class RtcpSender {
                        error.localizedDescription)
                 // Stop the timer before propagating the error (Req 3.4)
                 self.stop()
+                self.timerQueue.async { self.isSending = false }
                 self.onError(error)
             }
         }

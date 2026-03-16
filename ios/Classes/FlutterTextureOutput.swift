@@ -31,6 +31,9 @@ final class FlutterTextureOutput: NSObject, FlutterTexture {
     private let log = OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin",
                             category: "FlutterTextureOutput")
 
+    /// Shared CIContext — expensive to create, reused across all captureJpeg calls.
+    private let ciContext = CIContext()
+
     // MARK: - Init
 
     /// Registers this texture with the Flutter `TextureRegistry` and stores the
@@ -80,6 +83,23 @@ final class FlutterTextureOutput: NSObject, FlutterTexture {
         }
     }
 
+    // MARK: - Snapshot
+
+    /// Encodes the most recently decoded frame as JPEG data.
+    ///
+    /// Returns `nil` if no frame has been received yet.
+    func captureJpeg(compressionQuality: CGFloat = 0.85) -> Data? {
+        lock.lock()
+        let buffer = latestPixelBuffer
+        lock.unlock()
+        guard let buffer else { return nil }
+
+        let ciImage = CIImage(cvPixelBuffer: buffer)
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else { return nil }
+        let uiImage = UIImage(cgImage: cgImage)
+        return uiImage.jpegData(compressionQuality: compressionQuality)
+    }
+
     // MARK: - Stop
 
     /// Unregisters the texture from Flutter's `TextureRegistry` to release GPU
@@ -88,6 +108,7 @@ final class FlutterTextureOutput: NSObject, FlutterTexture {
         textureRegistry?.unregisterTexture(textureId)
         lock.lock()
         latestPixelBuffer = nil
+        textureRegistry = nil
         lock.unlock()
         os_log("FlutterTextureOutput: texture %lld unregistered", log: log, type: .info, textureId)
     }

@@ -73,11 +73,14 @@ final class RtspStreamSession: NSObject {
     /// - Returns: The `textureId` (Int64 cast to Int) for use with `Texture` widget.
     /// - Throws: `RtspError` on connection, auth, or decoder failure.
     func start() async throws -> Int {
-        // Register the event channel so Dart can subscribe before first frame
+        // Register the event channel so Dart can subscribe before first frame.
+        // FlutterEventChannel.setStreamHandler must be called on the main thread.
         let channelName = "flutter_rtsps_plugin/events/\(streamId)"
-        let channel = FlutterEventChannel(name: channelName, binaryMessenger: binaryMessenger)
-        channel.setStreamHandler(self)
-        eventChannel = channel
+        await MainActor.run {
+            let channel = FlutterEventChannel(name: channelName, binaryMessenger: binaryMessenger)
+            channel.setStreamHandler(self)
+            eventChannel = channel
+        }
 
         // Build transport + state machine
         let transport = RtspTransport()
@@ -97,7 +100,8 @@ final class RtspStreamSession: NSObject {
         guard let parsed = URL(string: url), let host = parsed.host else {
             throw RtspError.connectionFailed("Invalid RTSP URL: \(url)")
         }
-        let port = UInt16(parsed.port ?? 322)
+        let defaultPort = parsed.scheme?.lowercased() == "rtsps" ? 322 : 554
+        let port = UInt16(parsed.port ?? defaultPort)
         try await transport.connect(host: host, port: port)
         os_log("RtspStreamSession[%d]: transport connected", log: log, type: .info, streamId)
 
@@ -155,6 +159,14 @@ final class RtspStreamSession: NSObject {
         return Int(textureOut.textureId)
     }
 
+    // MARK: - Frame capture
+
+    /// Returns JPEG data from the most recently decoded frame, or `nil` if no
+    /// frame has been received yet.
+    func captureFrame() -> Data? {
+        return textureOutput?.captureJpeg()
+    }
+
     // MARK: - Stop
 
     /// Tears down all components in order and emits `RtspStoppedEvent`.
@@ -169,14 +181,19 @@ final class RtspStreamSession: NSObject {
 
         os_log("RtspStreamSession[%d]: stopping", log: log, type: .info, streamId)
 
-        // Race the teardown against a 2-second deadline (Req 9.3)
+        // Race the graceful teardown against a 2-second deadline (Req 9.3).
+        // We capture the transport reference before the race so we can force-close
+        // it if the timeout fires before performStop() finishes — ensuring the
+        // NWConnection is always released even if TEARDOWN hangs.
+        let capturedTransport = transport
         await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { [weak self] in
-                await self?.performStop()
+            group.addTask {
+                await self.performStop()
             }
             group.addTask {
                 try await Task.sleep(nanoseconds: 2_000_000_000)
-                // Timeout reached — cancel the other task
+                // Timeout reached — force-close the transport so the other task unblocks
+                capturedTransport?.close()
             }
             // Take whichever finishes first
             _ = try? await group.next()
@@ -208,16 +225,23 @@ final class RtspStreamSession: NSObject {
 
     // MARK: - Private — first frame
 
-    /// Called on every decoded frame; emits `RtspPlayingEvent` exactly once,
-    /// then emits a `frame` timestamp event for every subsequent frame.
+    /// Called on every decoded frame; emits `RtspPlayingEvent` exactly once
+    /// (which also carries the first frame timestamp), then emits a `frame`
+    /// timestamp event for every subsequent frame.
     private func onNewFrame() {
+        let ts = Int(Date().timeIntervalSince1970 * 1000)
         stateQueue.async { [weak self] in
             guard let self, !self.stopped else { return }
             if !self.firstFrameEmitted {
                 self.firstFrameEmitted = true
-                self.emitEvent(["type": "playing", "textureId": Int(self.textureOutput?.textureId ?? 0)])
+                // Include the timestamp so FpsOverlay counts the very first frame.
+                self.emitEvent([
+                    "type": "playing",
+                    "textureId": Int(self.textureOutput?.textureId ?? 0),
+                    "ts": ts
+                ])
             } else {
-                self.emitEvent(["type": "frame", "ts": Int(Date().timeIntervalSince1970 * 1000)])
+                self.emitEvent(["type": "frame", "ts": ts])
             }
         }
     }

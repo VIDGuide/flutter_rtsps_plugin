@@ -47,6 +47,14 @@ final class RtpDemuxer {
     /// by accumulated fragment payloads. (Req 2.7)
     private var fuaBuffer: Data?
 
+    /// The sequence number of the last RTP packet processed, used to detect gaps
+    /// within a FU-A reassembly sequence.
+    private var lastSeq: UInt32? = nil
+
+    /// Maximum size of a reassembled FU-A NAL unit (2 MB). Buffers exceeding
+    /// this are discarded to prevent unbounded memory growth on bad streams.
+    private static let maxFuaBufferSize = 2 * 1024 * 1024
+
     /// Running RTP statistics forwarded to RtcpSender.
     private var stats = RtpStats(ssrc: 0, highestSeq: 0, packetCount: 0, octetCount: 0)
 
@@ -94,9 +102,8 @@ final class RtpDemuxer {
                 let channel = header[1]
                 let length = (UInt16(header[2]) << 8) | UInt16(header[3])
 
-                // Discard oversized frames without terminating the stream (Req 2.6)
-                if length > 65535 {
-                    os_log("RtpDemuxer: frame length %u exceeds 65535, discarding", log: log, type: .default, length)
+                // Discard zero-length frames
+                if length == 0 {
                     continue
                 }
 
@@ -174,24 +181,78 @@ final class RtpDemuxer {
         stats.octetCount += UInt32(payload.count)
         onRtpStats?(stats)
 
+        // Detect sequence number discontinuity — if a gap is detected while
+        // reassembling a FU-A unit, discard the stale buffer so we don't
+        // forward a corrupt NAL unit to the decoder.
+        if let last = lastSeq {
+            let expected = (last + 1) & 0xFFFF
+            if seqNum != expected && fuaBuffer != nil {
+                os_log("RtpDemuxer: seq gap detected (%u → %u), discarding FU-A buffer",
+                       log: log, type: .default, last, seqNum)
+                fuaBuffer = nil
+            }
+        }
+        lastSeq = seqNum
+
         // Dispatch NAL unit extraction
         extractNalUnit(from: Data(payload), markerBit: markerBit)
     }
 
     // MARK: - NAL Unit Extraction
 
-    /// Extracts a NAL unit from the RTP payload, handling FU-A fragmentation.
+    /// Extracts a NAL unit from the RTP payload, handling FU-A fragmentation
+    /// and STAP-A aggregation.
     private func extractNalUnit(from payload: Data, markerBit: Bool) {
         guard !payload.isEmpty else { return }
 
         let nalType = payload[0] & 0x1F
 
-        if nalType == 28 {
+        switch nalType {
+        case 28:
             // FU-A fragmented NAL unit (Req 2.7)
             handleFuA(payload: payload, markerBit: markerBit)
-        } else {
+        case 24:
+            // STAP-A: multiple NAL units aggregated in one RTP packet (RFC 6184 §5.7.1)
+            // Format: STAP-A header (1 byte) | [size (2 bytes) | NAL unit] ...
+            // The marker bit applies to the last NAL unit in the packet.
+            handleStapA(payload: payload, markerBit: markerBit)
+        default:
             // Single NAL unit packet — forward directly
             onNalUnit?(payload, markerBit)
+        }
+    }
+
+    // MARK: - STAP-A Aggregation
+
+    /// Handles STAP-A (NAL type 24) packets which carry multiple NAL units
+    /// concatenated with 2-byte size prefixes (RFC 6184 §5.7.1).
+    ///
+    /// The marker bit signals end-of-access-unit and is forwarded only with
+    /// the last NAL unit in the packet.
+    private func handleStapA(payload: Data, markerBit: Bool) {
+        // Skip the 1-byte STAP-A header
+        var offset = 1
+        var nalUnits: [Data] = []
+
+        while offset + 2 <= payload.count {
+            let size = Int(UInt16(payload[offset]) << 8 | UInt16(payload[offset + 1]))
+            offset += 2
+            guard size > 0, offset + size <= payload.count else {
+                os_log("RtpDemuxer: STAP-A malformed at offset %d (size=%d, remaining=%d)",
+                       log: log, type: .error, offset, size, payload.count - offset)
+                break
+            }
+            nalUnits.append(Data(payload[offset ..< offset + size]))
+            offset += size
+        }
+
+        guard !nalUnits.isEmpty else { return }
+
+        for (i, nal) in nalUnits.enumerated() {
+            let isLast = i == nalUnits.index(before: nalUnits.endIndex)
+            // Only set the marker bit on the last NAL unit — it signals
+            // end-of-access-unit to the decoder's accumulation logic.
+            onNalUnit?(nal, isLast && markerBit)
         }
     }
 
@@ -242,6 +303,15 @@ final class RtpDemuxer {
             fuaBuffer?.append(contentsOf: fragment)
         } else if var buf = fuaBuffer {
             buf.append(contentsOf: fragment)
+
+            // Guard against unbounded accumulation on malformed/corrupt streams
+            if buf.count > RtpDemuxer.maxFuaBufferSize {
+                os_log("RtpDemuxer: FU-A buffer exceeded %d bytes, discarding",
+                       log: log, type: .error, RtpDemuxer.maxFuaBufferSize)
+                fuaBuffer = nil
+                return
+            }
+
             fuaBuffer = buf
 
             if isEnd {

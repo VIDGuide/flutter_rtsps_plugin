@@ -185,35 +185,66 @@ final class RtspStateMachine {
     /// Reads bytes from the transport until the RTSP response header terminator
     /// `\r\n\r\n` is found, then reads the body if `Content-Length` is present.
     ///
+    /// Maintains a `lookahead` buffer so we can read in small chunks without
+    /// ever discarding bytes that belong to the body or the subsequent RTP stream.
+    ///
     /// Handles interleaved RTP/RTCP frames (`$` prefix) that may arrive before
-    /// or between RTSP responses on H2-series Bambu printers — these are silently
-    /// drained so the handshake can proceed.
+    /// OR between RTSP response lines on H2-series Bambu printers.
     private func readResponse() async throws -> RtspResponse {
-        var headerData = Data()
         let terminator = Data([0x0D, 0x0A, 0x0D, 0x0A]) // \r\n\r\n
 
-        // Read byte-by-byte until we see \r\n\r\n
-        while !headerData.hasSuffix(terminator) {
-            let byte = try await transport.receive(minimumLength: 1, maximumLength: 1)
+        // Bytes fetched from the transport but not yet consumed.
+        var lookahead = Data()
 
-            // If we haven't started accumulating yet and this is an interleaved
-            // frame marker ($=0x24), drain the 3-byte header + payload and retry.
-            if headerData.isEmpty && byte.first == 0x24 {
-                // Interleaved frame: $ | channel (1 byte) | length (2 bytes BE)
-                let rest = try await transport.receive(minimumLength: 3, maximumLength: 3)
-                let length = Int(rest[1]) << 8 | Int(rest[2])
-                if length > 0 {
-                    var drained = 0
-                    while drained < length {
-                        let chunk = try await transport.receive(minimumLength: 1, maximumLength: length - drained)
-                        drained += chunk.count
+        // Accumulates header bytes up to and including \r\n\r\n.
+        var headerData = Data()
+
+        while !headerData.hasSuffix(terminator) {
+            // Refill lookahead if empty.
+            if lookahead.isEmpty {
+                let chunk = try await transport.receive(minimumLength: 1, maximumLength: 256)
+                lookahead.append(chunk)
+            }
+            let byte = lookahead.removeFirst()
+
+            // Interleaved RTP/RTCP frame: drain it entirely and restart.
+            // This can arrive at ANY point — not just at the start of a response —
+            // on H2-series Bambu printers that pipeline RTP before the RTSP reply.
+            // We detect it when headerData ends on a line boundary (empty or after
+            // a complete \r\n) so we don't misidentify a `$` inside a header value.
+            let onLineBoundary = headerData.isEmpty ||
+                headerData.hasSuffix(Data([0x0D, 0x0A]))
+            if byte == 0x24 && onLineBoundary {
+                // Need channel (1 byte) + length (2 bytes).
+                while lookahead.count < 3 {
+                    let more = try await transport.receive(minimumLength: 1, maximumLength: 3 - lookahead.count)
+                    lookahead.append(more)
+                }
+                // Read length before mutating lookahead.
+                let lenHi = lookahead[1]
+                let lenLo = lookahead[2]
+                lookahead.removeFirst(3)
+                let payloadLength = Int(lenHi) << 8 | Int(lenLo)
+
+                if payloadLength > 0 {
+                    if lookahead.count >= payloadLength {
+                        lookahead.removeFirst(payloadLength)
+                    } else {
+                        var remaining = payloadLength - lookahead.count
+                        lookahead.removeAll()
+                        while remaining > 0 {
+                            let drain = try await transport.receive(
+                                minimumLength: 1,
+                                maximumLength: min(remaining, 4096)
+                            )
+                            remaining -= drain.count
+                        }
                     }
                 }
-                continue // restart looking for RTSP response
+                continue
             }
 
             headerData.append(byte)
-            // Safety cap: 64 KB for headers
             if headerData.count > 65_536 {
                 throw RtspError.connectionFailed("RTSP response headers exceeded 64 KB")
             }
@@ -225,11 +256,18 @@ final class RtspStateMachine {
 
         let response = try parseResponseHeaders(headerString)
 
-        // Read body if Content-Length is present
+        // Read body if Content-Length is present, consuming lookahead first.
         if let lengthStr = response.headers["content-length"],
            let length = Int(lengthStr.trimmingCharacters(in: .whitespaces)),
            length > 0 {
             var bodyData = Data()
+
+            let fromLookahead = min(lookahead.count, length)
+            if fromLookahead > 0 {
+                bodyData.append(lookahead.prefix(fromLookahead))
+                lookahead.removeFirst(fromLookahead)
+            }
+
             while bodyData.count < length {
                 let remaining = length - bodyData.count
                 let chunk = try await transport.receive(minimumLength: 1, maximumLength: remaining)
