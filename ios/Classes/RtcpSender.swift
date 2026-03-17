@@ -13,7 +13,7 @@ import os.log
 /// RTCP Receiver Report structure (RFC 3550):
 ///   Header (8 bytes):
 ///     V=2(2) P=0(1) RC=1(5) | PT=201(8) | length=7(16)
-///     SSRC of packet sender (4 bytes) — fixed 0 (we are the receiver)
+///     SSRC of packet sender (4 bytes) — random per RFC 3550 §6.4.2
 ///   Report block (24 bytes):
 ///     SSRC of source (4 bytes)
 ///     Fraction lost (1 byte) | Cumulative lost (3 bytes)
@@ -33,10 +33,15 @@ final class RtcpSender {
     private let timerQueue = DispatchQueue(label: "com.pandawatch.flutter_rtsps_plugin.rtcp")
 
     /// Guards against overlapping sends if a send takes longer than the 1-second interval.
+    /// Only accessed on `timerQueue`.
     private var isSending = false
 
     /// Most recent RTP statistics snapshot, updated by `updateStats(_:)`.
+    /// Only accessed on `timerQueue` to prevent torn reads/writes. (Req 2.4)
     private var stats = RtpStats(ssrc: 0, highestSeq: 0, packetCount: 0, octetCount: 0)
+
+    /// Random receiver SSRC generated once per session per RFC 3550 §6.4.2. (Req 2.27)
+    private let receiverSsrc: UInt32 = UInt32.random(in: 0...UInt32.max)
 
     private let log = OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin", category: "RtcpSender")
 
@@ -55,17 +60,24 @@ final class RtcpSender {
 
     /// Updates the RTP statistics used to populate the next Receiver Report.
     /// Called by `RtpDemuxer`'s `onRtpStats` callback. (Req 3.2)
-    func updateStats(_ stats: RtpStats) {
-        self.stats = stats
+    /// Dispatches to `timerQueue` so reads and writes are serialized. (Req 2.4)
+    func updateStats(_ newStats: RtpStats) {
+        timerQueue.async { [weak self] in
+            self?.stats = newStats
+        }
     }
 
     // MARK: - Lifecycle
 
-    /// Creates and starts a `DispatchSourceTimer` that fires every 1 second
-    /// on a background queue. (Req 3.1)
-    func start() {
+    /// Creates and starts a `DispatchSourceTimer` on a background queue. (Req 3.1)
+    ///
+    /// - Parameter interval: Seconds between Receiver Reports. Defaults to 1.0.
+    ///   When the server advertises a session timeout, callers should pass
+    ///   `min(1.0, timeout / 3)` so the keepalive fires well within the
+    ///   server's expiry window (Req 2.14).
+    func start(interval: TimeInterval = 1.0) {
         let t = DispatchSource.makeTimerSource(queue: timerQueue)
-        t.schedule(deadline: .now() + 1, repeating: 1.0)
+        t.schedule(deadline: .now() + interval, repeating: interval)
         t.setEventHandler { [weak self] in
             self?.sendReceiverReport()
         }
@@ -100,9 +112,9 @@ final class RtcpSender {
             guard let self else { return }
             do {
                 try await self.transport.send(data: frame)
-                // Clear the flag back on timerQueue to stay on the same executor
-                // that set it, avoiding any ordering ambiguity.
-                self.timerQueue.async { self.isSending = false }
+                // Clear the flag synchronously on timerQueue so the next timer
+                // tick sees the updated value immediately. (Req 2.5)
+                self.timerQueue.sync { self.isSending = false }
                 os_log("RtcpSender: sent RR (ssrc=%u, seq=%u)",
                        log: self.log, type: .debug,
                        self.stats.ssrc, self.stats.highestSeq)
@@ -111,7 +123,7 @@ final class RtcpSender {
                        error.localizedDescription)
                 // Stop the timer before propagating the error (Req 3.4)
                 self.stop()
-                self.timerQueue.async { self.isSending = false }
+                self.timerQueue.sync { self.isSending = false }
                 self.onError(error)
             }
         }
@@ -132,8 +144,8 @@ final class RtcpSender {
         // Header bytes 2-3: length = 7  (total 32 bytes / 4 - 1)
         data.appendUInt16BE(7)
 
-        // SSRC of packet sender (we are the receiver — use 0)
-        data.appendUInt32BE(0)
+        // SSRC of packet sender (we are the receiver — random per RFC 3550 §6.4.2)
+        data.appendUInt32BE(receiverSsrc)
 
         // --- Report block (24 bytes) ---
 
@@ -159,6 +171,16 @@ final class RtcpSender {
         data.appendUInt32BE(0)
 
         return data
+    }
+
+    // MARK: - Testing Shims
+
+    /// Exposes `buildReceiverReport` for unit tests.
+    /// Reads stats synchronously on `timerQueue` to match production access pattern.
+    func buildReceiverReportForTesting() -> Data {
+        return timerQueue.sync {
+            buildReceiverReport(stats: stats)
+        }
     }
 
     // MARK: - TCP Interleaved Frame Wrapper

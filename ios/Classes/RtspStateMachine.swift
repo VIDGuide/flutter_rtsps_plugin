@@ -1,4 +1,4 @@
-import CommonCrypto
+import CryptoKit
 import Foundation
 
 // MARK: - RtspStateMachine
@@ -29,10 +29,23 @@ final class RtspStateMachine {
     private let path: String
 
     /// Monotonically increasing CSeq counter.
+    /// **Single-caller assumption (Defect 1.32)**: During the handshake phase,
+    /// all requests are sequential (awaited). During the streaming phase,
+    /// only `sendGetParameter()` may use this counter, and it should be
+    /// called from a single serial context (e.g. a timer on a dedicated queue).
     private var cseq: Int = 1
 
     /// Session ID returned by the server in the SETUP response.
     private var sessionId: String?
+
+    /// Server session timeout in seconds, parsed from the Session header's
+    /// `timeout=N` parameter (Defect 1.13).
+    private var serverTimeout: Int?
+
+    /// Unconsumed lookahead bytes remaining after the last `readResponse()`.
+    /// These may contain the beginning of the RTP interleaved stream and must
+    /// be forwarded to the `RtpDemuxer` (Defect 1.12).
+    var remainingData: Data?
 
     // MARK: - Init
 
@@ -65,7 +78,7 @@ final class RtspStateMachine {
     ///           `RtspError.authenticationFailed` if Digest auth fails,
     ///           `RtspError.noVideoTrack` if the SDP has no video section,
     ///           `RtspError.connectionFailed` for transport-level errors.
-    func runHandshake() async throws -> SdpVideoTrack {
+    func runHandshake() async throws -> HandshakeResult {
         // OPTIONS
         _ = try await sendRequest(method: "OPTIONS", uri: url)
 
@@ -85,10 +98,18 @@ final class RtspStateMachine {
         let setupResponse = try await sendRequest(method: "SETUP", uri: controlUrl, extraHeaders: [
             "Transport": "RTP/AVP/TCP;unicast;interleaved=0-1"
         ])
-        // Extract session ID from SETUP response
+        // Extract session ID and timeout from SETUP response (Defect 1.13)
         if let sessionHeader = setupResponse.headers["session"] {
-            // Session header may include a timeout: "abc123;timeout=60"
-            sessionId = sessionHeader.components(separatedBy: ";").first?.trimmingCharacters(in: .whitespaces)
+            let parts = sessionHeader.components(separatedBy: ";")
+            sessionId = parts.first?.trimmingCharacters(in: .whitespaces)
+            // Parse timeout=N from remaining parts
+            for part in parts.dropFirst() {
+                let trimmed = part.trimmingCharacters(in: .whitespaces).lowercased()
+                if trimmed.hasPrefix("timeout="),
+                   let value = Int(trimmed.dropFirst("timeout=".count)) {
+                    serverTimeout = value
+                }
+            }
         }
 
         // PLAY
@@ -98,7 +119,16 @@ final class RtspStateMachine {
         }
         _ = try await sendRequest(method: "PLAY", uri: url, extraHeaders: playHeaders)
 
-        return videoTrack
+        // Capture any unconsumed lookahead bytes from the last readResponse()
+        // so they can be forwarded to the RtpDemuxer (Defect 1.12).
+        let leftover = remainingData
+        remainingData = nil
+
+        return HandshakeResult(
+            videoTrack: videoTrack,
+            remainingData: leftover,
+            serverTimeout: serverTimeout
+        )
     }
 
     /// Sends TEARDOWN and closes the transport.
@@ -110,6 +140,20 @@ final class RtspStateMachine {
         // Best-effort — ignore errors during teardown
         _ = try? await sendRequest(method: "TEARDOWN", uri: url, extraHeaders: headers)
         transport.close()
+    }
+
+    /// Sends a GET_PARAMETER keepalive request to prevent the server from
+    /// timing out the session. Only useful when the server advertises a
+    /// short session timeout (Defect 1.29).
+    ///
+    /// - Note: This method shares the `cseq` counter with `sendRequest`.
+    ///   It is safe to call concurrently with the streaming phase because
+    ///   the handshake has already completed and no other RTSP requests
+    ///   are in flight. See Defect 1.32 for the single-caller assumption.
+    func sendGetParameter() async throws {
+        guard let sid = sessionId else { return }
+        let headers = ["Session": sid]
+        _ = try await sendRequest(method: "GET_PARAMETER", uri: url, extraHeaders: headers)
     }
 
     // MARK: - Request / Response
@@ -151,7 +195,8 @@ final class RtspStateMachine {
                 method: method,
                 uri: uri,
                 realm: digest.realm,
-                nonce: digest.nonce
+                nonce: digest.nonce,
+                qop: digest.qop
             )
             // Retry with auth — do NOT recurse again on another 401
             let retryHeaders = extraHeaders.merging(["Authorization": computedAuth]) { _, new in new }
@@ -273,12 +318,23 @@ final class RtspStateMachine {
                 let chunk = try await transport.receive(minimumLength: 1, maximumLength: remaining)
                 bodyData.append(chunk)
             }
+
+            // Store any unconsumed lookahead bytes so they are not lost (Defect 1.12).
+            if !lookahead.isEmpty {
+                remainingData = lookahead
+            }
+
             return RtspResponse(
                 statusCode: response.statusCode,
                 reason: response.reason,
                 headers: response.headers,
                 body: String(data: bodyData, encoding: .utf8)
             )
+        }
+
+        // Store any unconsumed lookahead bytes so they are not lost (Defect 1.12).
+        if !lookahead.isEmpty {
+            remainingData = lookahead
         }
 
         return response
@@ -357,9 +413,13 @@ final class RtspStateMachine {
     private struct DigestChallenge {
         let realm: String
         let nonce: String
+        let qop: String?  // e.g. "auth" or "auth,auth-int"
     }
 
-    /// Parses `realm` and `nonce` from a `WWW-Authenticate: Digest ...` header value.
+    /// Nonce count for Digest auth with qop=auth, incremented per request.
+    private var nonceCount: Int = 0
+
+    /// Parses `realm`, `nonce`, and optional `qop` from a `WWW-Authenticate: Digest ...` header value.
     private func parseDigestChallenge(_ header: String) throws -> DigestChallenge {
         func extractQuoted(_ key: String, from str: String) -> String? {
             guard let keyRange = str.range(of: "\(key)=\"") else { return nil }
@@ -368,32 +428,92 @@ final class RtspStateMachine {
             return String(afterKey[..<closeQuote])
         }
 
+        /// Extracts an unquoted parameter value (e.g. `qop=auth`).
+        func extractUnquoted(_ key: String, from str: String) -> String? {
+            guard let keyRange = str.range(of: "\(key)=") else { return nil }
+            let afterKey = str[keyRange.upperBound...]
+            // Value ends at comma, space, or end of string
+            let endIdx = afterKey.firstIndex(where: { $0 == "," || $0 == " " || $0 == "\t" }) ?? afterKey.endIndex
+            let value = String(afterKey[..<endIdx])
+            return value.isEmpty ? nil : value
+        }
+
         guard let realm = extractQuoted("realm", from: header),
               let nonce = extractQuoted("nonce", from: header) else {
             throw RtspError.authenticationFailed
         }
-        return DigestChallenge(realm: realm, nonce: nonce)
+
+        // qop may be quoted or unquoted per RFC 2617
+        let qop = extractQuoted("qop", from: header)
+            ?? extractUnquoted("qop", from: header)
+
+        return DigestChallenge(realm: realm, nonce: nonce, qop: qop)
     }
 
     /// Builds the `Authorization: Digest ...` header value.
-    private func buildDigestAuthorization(method: String, uri: String, realm: String, nonce: String) -> String {
+    /// When `qop` contains `auth`, includes `cnonce`, `nc`, and `qop=auth` per RFC 2617.
+    /// When `qop` is nil, uses the simple Digest computation (backward compatible).
+    private func buildDigestAuthorization(method: String, uri: String, realm: String, nonce: String, qop: String? = nil) -> String {
         let ha1 = md5("\(username):\(realm):\(password)")
         let ha2 = md5("\(method):\(uri)")
-        let response = md5("\(ha1):\(nonce):\(ha2)")
-        return "Digest username=\"\(username)\", realm=\"\(realm)\", nonce=\"\(nonce)\", uri=\"\(uri)\", response=\"\(response)\""
+
+        if let qop = qop, qop.contains("auth") {
+            nonceCount += 1
+            let nc = String(format: "%08x", nonceCount)
+            let cnonce = String(format: "%08x", UInt32.random(in: 0...UInt32.max))
+            let response = md5("\(ha1):\(nonce):\(nc):\(cnonce):auth:\(ha2)")
+            return "Digest username=\"\(username)\", realm=\"\(realm)\", nonce=\"\(nonce)\", uri=\"\(uri)\", qop=auth, nc=\(nc), cnonce=\"\(cnonce)\", response=\"\(response)\""
+        } else {
+            let response = md5("\(ha1):\(nonce):\(ha2)")
+            return "Digest username=\"\(username)\", realm=\"\(realm)\", nonce=\"\(nonce)\", uri=\"\(uri)\", response=\"\(response)\""
+        }
     }
+
+    // MARK: - Testing Shims
+
+    /// Exposes `buildDigestAuthorization` for unit tests, with optional qop support.
+    func buildDigestAuthorizationForTesting(
+        method: String,
+        uri: String,
+        realm: String,
+        nonce: String,
+        qop: String? = nil
+    ) -> String {
+        return buildDigestAuthorization(method: method, uri: uri, realm: realm, nonce: nonce, qop: qop)
+    }
+
+    /// Exposes `md5` for unit tests.
+    func md5ForTesting(_ string: String) -> String {
+        return md5(string)
+    }
+
+    /// Indicates that the MD5 implementation uses CryptoKit (not deprecated CommonCrypto CC_MD5).
+    /// Used by bug condition exploration tests to verify the migration (Req 2.31).
+    static let usesCryptoKitMD5: Bool = true
 
     // MARK: - MD5 Helper
 
     /// Computes the lowercase hex MD5 digest of a UTF-8 string.
     private func md5(_ string: String) -> String {
-        let data = Data(string.utf8)
-        var digest = [UInt8](repeating: 0, count: Int(CC_MD5_DIGEST_LENGTH))
-        data.withUnsafeBytes { ptr in
-            _ = CC_MD5(ptr.baseAddress, CC_LONG(data.count), &digest)
-        }
+        let digest = Insecure.MD5.hash(data: Data(string.utf8))
         return digest.map { String(format: "%02x", $0) }.joined()
     }
+}
+
+// MARK: - HandshakeResult
+
+/// Result of a successful RTSP handshake, containing the video track info,
+/// any unconsumed lookahead bytes from the transport, and the server session timeout.
+struct HandshakeResult {
+    /// The parsed video track from the SDP DESCRIBE response.
+    let videoTrack: SdpVideoTrack
+    /// Bytes remaining in the read buffer after the final RTSP response.
+    /// These may contain the start of the RTP interleaved stream and must
+    /// be passed to the `RtpDemuxer` so they are not lost (Defect 1.12).
+    let remainingData: Data?
+    /// Server session timeout in seconds parsed from the Session header's
+    /// `timeout=N` parameter, or `nil` if not provided (Defect 1.13).
+    let serverTimeout: Int?
 }
 
 // MARK: - RtspResponse

@@ -1,4 +1,5 @@
 import XCTest
+@testable import flutter_rtsps_plugin
 
 // SdpParser and SdpVideoTrack are defined in the plugin's Classes/ directory.
 // When wired into an Xcode test target, add both SdpParser.swift and

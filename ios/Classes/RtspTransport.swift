@@ -34,9 +34,16 @@ enum RtspError: Error, LocalizedError {
 /// Bambu Lab printers that use self-signed TLS certificates (Req 1.7).
 final class RtspTransport {
 
+    // MARK: - Public callbacks
+
+    /// Called when a post-connection failure is detected (`.failed` or `.cancelled`
+    /// state after the connection was previously `.ready`).
+    var onDisconnect: ((Error) -> Void)?
+
     // MARK: - Private state
 
     private var connection: NWConnection?
+    private var connectionState: NWConnection.State = .setup
     private let dispatchQueue = DispatchQueue(label: "com.pandawatch.flutter_rtsps_plugin.transport")
 
     // MARK: - Connect
@@ -60,6 +67,7 @@ final class RtspTransport {
             var resumed = false
 
             conn.stateUpdateHandler = { [weak self] state in
+                self?.connectionState = state
                 guard !resumed else { return }
                 switch state {
                 case .ready:
@@ -83,6 +91,23 @@ final class RtspTransport {
 
             conn.start(queue: self.dispatchQueue)
         }
+
+        // Post-connection monitoring: detect .failed/.cancelled after .ready
+        connection?.stateUpdateHandler = { [weak self] state in
+            self?.connectionState = state
+            switch state {
+            case .failed(let error):
+                self?.connection = nil
+                self?.onDisconnect?(RtspError.connectionFailed(error.localizedDescription))
+
+            case .cancelled:
+                self?.connection = nil
+                self?.onDisconnect?(RtspError.connectionFailed("Connection was cancelled"))
+
+            default:
+                break
+            }
+        }
     }
 
     // MARK: - Send
@@ -91,6 +116,9 @@ final class RtspTransport {
     ///
     /// Throws `RtspError.connectionFailed` on write error.
     func send(data: Data) async throws {
+        guard connectionState == .ready else {
+            throw RtspError.connectionFailed("Connection not ready: \(connectionState)")
+        }
         guard let conn = connection else {
             throw RtspError.connectionFailed("Not connected")
         }
@@ -113,6 +141,9 @@ final class RtspTransport {
     /// Throws `RtspError.connectionFailed` on read error or if the connection
     /// closes before the minimum number of bytes is received.
     func receive(minimumLength: Int, maximumLength: Int) async throws -> Data {
+        guard connectionState == .ready else {
+            throw RtspError.connectionFailed("Connection not ready: \(connectionState)")
+        }
         guard let conn = connection else {
             throw RtspError.connectionFailed("Not connected")
         }
@@ -143,6 +174,7 @@ final class RtspTransport {
     func close() {
         connection?.cancel()
         connection = nil
+        connectionState = .setup
     }
 
     // MARK: - Private helpers

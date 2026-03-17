@@ -86,6 +86,8 @@ class _StreamPageState extends State<StreamPage> {
               setState(() => _status = 'Error: ${exception.message}');
             case RtspStoppedEvent():
               setState(() => _status = 'Stopped');
+            case RtspFrameEvent():
+              break; // Frame events are handled by the Texture widget
           }
         },
       );

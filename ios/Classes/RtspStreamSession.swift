@@ -40,10 +40,15 @@ final class RtspStreamSession: NSObject {
 
     // MARK: - Private — state flags
 
-    /// Serial queue protecting `stopped`, `firstFrameEmitted`, and `eventSink`.
+    /// Serial queue protecting `stopped`, `started`, `firstFrameEmitted`, and `eventSink`.
     private let stateQueue = DispatchQueue(label: "com.pandawatch.flutter_rtsps_plugin.session.\(arc4random())")
     private var stopped = false
+    private var started = false
     private var firstFrameEmitted = false
+
+    /// The Task running `start()`. Cancelled by `RtspStreamManager.stopStream`
+    /// to abort an in-flight connection attempt (Defect 1.7).
+    var startTask: Task<Int, Error>?
 
     private let log = OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin", category: "RtspStreamSession")
 
@@ -73,6 +78,16 @@ final class RtspStreamSession: NSObject {
     /// - Returns: The `textureId` (Int64 cast to Int) for use with `Texture` widget.
     /// - Throws: `RtspError` on connection, auth, or decoder failure.
     func start() async throws -> Int {
+        // Guard against duplicate start (Defect 1.2)
+        let alreadyStarted: Bool = stateQueue.sync {
+            if started { return true }
+            started = true
+            return false
+        }
+        guard !alreadyStarted else {
+            throw RtspError.connectionFailed("Session already started")
+        }
+
         // Register the event channel so Dart can subscribe before first frame.
         // FlutterEventChannel.setStreamHandler must be called on the main thread.
         let channelName = "flutter_rtsps_plugin/events/\(streamId)"
@@ -105,9 +120,16 @@ final class RtspStreamSession: NSObject {
         try await transport.connect(host: host, port: port)
         os_log("RtspStreamSession[%d]: transport connected", log: log, type: .info, streamId)
 
+        // Check for cancellation after connect (Defect 1.7)
+        try Task.checkCancellation()
+
         // Run RTSP handshake
-        let videoTrack = try await sm.runHandshake()
+        let handshakeResult = try await sm.runHandshake()
+        let videoTrack = handshakeResult.videoTrack
         os_log("RtspStreamSession[%d]: handshake complete", log: log, type: .info, streamId)
+
+        // Check for cancellation after handshake (Defect 1.7)
+        try Task.checkCancellation()
 
         // Create texture output (must happen before decoder so callback is wired)
         let textureOut = FlutterTextureOutput(textureRegistry: textureRegistry)
@@ -148,6 +170,12 @@ final class RtspStreamSession: NSObject {
             rtcp?.updateStats(stats)
         }
         self.demuxer = demux
+
+        // Seed any leftover bytes from the handshake so the first RTP
+        // packets are not lost (Defect 1.12, Req 2.12).
+        if let leftover = handshakeResult.remainingData {
+            demux.seedData(leftover)
+        }
 
         // Start streaming components
         demux.start()
@@ -221,6 +249,20 @@ final class RtspStreamSession: NSObject {
 
         // 5. Unregister texture
         textureOutput?.stop()
+
+        // 6. Nil component references so late-firing callbacks find nil (Defect 1.20)
+        transport = nil
+        stateMachine = nil
+        demuxer = nil
+        rtcpSender = nil
+        decoder = nil
+        textureOutput = nil
+
+        // 7. Clean up event channel (Defect 1.21)
+        await MainActor.run {
+            eventChannel?.setStreamHandler(nil)
+            eventChannel = nil
+        }
     }
 
     // MARK: - Private — first frame
@@ -250,8 +292,16 @@ final class RtspStreamSession: NSObject {
 
     /// Shared error handler for `RtcpSender.onError` and `H264Decoder.onError`.
     /// Emits an error event then calls `stop()` (which emits stopped). (Req 9.6, 10.3)
+    ///
+    /// Atomically checks-and-sets `stopped` within a single `stateQueue.sync`
+    /// block, then calls `performStop()` directly — no separate Task dispatch
+    /// (Defect 1.1: prevents double-teardown race).
     private func handleError(_ error: Error) {
-        let alreadyStopped: Bool = stateQueue.sync { stopped }
+        let alreadyStopped: Bool = stateQueue.sync {
+            if stopped { return true }
+            stopped = true
+            return false
+        }
         guard !alreadyStopped else { return }
 
         os_log("RtspStreamSession[%d]: error — %{public}@",
@@ -263,7 +313,11 @@ final class RtspStreamSession: NSObject {
         emitEvent(["type": "error", "code": code, "message": message])
 
         Task { [weak self] in
-            await self?.stop()
+            guard let self else { return }
+            // stopped is already set — go straight to teardown + emit stopped
+            await self.performStop()
+            self.emitEvent(["type": "stopped"])
+            os_log("RtspStreamSession[%d]: stopped (from handleError)", log: self.log, type: .info, self.streamId)
         }
     }
 

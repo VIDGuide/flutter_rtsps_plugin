@@ -289,6 +289,9 @@ final class H264Decoder {
 
     /// Invalidates the `VTDecompressionSession` and releases all resources. (Req 4.6)
     func stop() {
+        // Clear pending NAL units immediately to prevent further decode
+        // submissions while teardown is dispatched. (Defect 1.23 fix)
+        pendingNalUnits = []
         queue.async { [weak self] in
             self?.tearDownSession()
         }
@@ -298,6 +301,11 @@ final class H264Decoder {
 
     private func tearDownSession() {
         if let session = decompressionSession {
+            // Wait for all in-flight async decode callbacks to complete before
+            // invalidating the session. This prevents use-after-free when a VT
+            // callback fires after the session (and its Unmanaged refcon) is
+            // torn down. (Defect 1.6 fix)
+            VTDecompressionSessionWaitForAsynchronousFrames(session)
             VTDecompressionSessionInvalidate(session)
             decompressionSession = nil
             os_log("H264Decoder: VTDecompressionSession invalidated", log: log, type: .info)

@@ -66,12 +66,14 @@ class RtspStreamManager {
             self.sessions[streamId] = session
             self.log("startStream: created session streamId=\(streamId)")
 
-            Task {
+            // Store the Task so stopStream can cancel an in-flight start (Defect 1.7)
+            let task: Task<Int, Error> = Task {
                 do {
                     let textureId = try await session.start()
                     DispatchQueue.main.async {
                         result(["streamId": streamId, "textureId": textureId])
                     }
+                    return textureId
                 } catch {
                     self.queue.async {
                         self.sessions.removeValue(forKey: streamId)
@@ -80,8 +82,10 @@ class RtspStreamManager {
                     DispatchQueue.main.async {
                         result(flutterError)
                     }
+                    throw error
                 }
             }
+            session.startTask = task
         }
     }
 
@@ -97,6 +101,9 @@ class RtspStreamManager {
             }
 
             self.log("stopStream: stopping streamId=\(streamId)")
+            // Cancel any in-flight start() Task before stopping (Defect 1.7)
+            session.startTask?.cancel()
+            session.startTask = nil
             Task {
                 await session.stop()
                 DispatchQueue.main.async { result(nil) }

@@ -42,6 +42,9 @@ final class RtpDemuxer {
 
     private let transport: RtspTransport
     private var running = false
+    /// Lock protecting reads/writes of `running` across the read-loop Task
+    /// and callers of `stop()` from arbitrary threads (Req 2.3).
+    private let runLock = NSLock()
 
     /// FU-A reassembly buffer. Holds the reconstructed NAL header byte followed
     /// by accumulated fragment payloads. (Req 2.7)
@@ -50,6 +53,10 @@ final class RtpDemuxer {
     /// The sequence number of the last RTP packet processed, used to detect gaps
     /// within a FU-A reassembly sequence.
     private var lastSeq: UInt32? = nil
+
+    /// Number of 16-bit sequence number wraparound cycles observed, used to
+    /// compute the extended highest sequence number per RFC 3550 (Defect 1.28).
+    private var seqCycles: UInt32 = 0
 
     /// Maximum size of a reassembled FU-A NAL unit (2 MB). Buffers exceeding
     /// this are discarded to prevent unbounded memory growth on bad streams.
@@ -68,29 +75,88 @@ final class RtpDemuxer {
         self.transport = transport
     }
 
+    // MARK: - Seed Data
+
+    /// Prepends leftover bytes from the RTSP handshake so they are processed
+    /// at the start of the read loop instead of being lost (Defect 1.12).
+    ///
+    /// Must be called BEFORE `start()`.
+    func seedData(_ data: Data) {
+        seedBuffer = data
+    }
+
+    /// Bytes seeded from the handshake lookahead, consumed at the start of the read loop.
+    private var seedBuffer: Data?
+
     // MARK: - Lifecycle
 
     /// Launches a Swift `Task` that runs the read loop until `stop()` is called
     /// or the transport closes.
     func start() {
+        runLock.lock()
         running = true
+        runLock.unlock()
         Task { [weak self] in
             await self?.readLoop()
         }
     }
 
     /// Signals the read loop to exit after the current iteration.
+    /// Clears reassembly state so a subsequent `start()` begins fresh (Req 2.22).
     func stop() {
+        runLock.lock()
         running = false
+        fuaBuffer = nil
+        lastSeq = nil
+        seqCycles = 0
+        seedBuffer = nil
+        runLock.unlock()
     }
 
     // MARK: - Read Loop
 
     private func readLoop() async {
-        while running {
+        // Consume any seed data from the handshake lookahead (Defect 1.12).
+        // These bytes are prepended to the stream so the first RTP packets
+        // are not lost.
+        var pendingSeed: Data? = nil
+        runLock.lock()
+        pendingSeed = seedBuffer
+        seedBuffer = nil
+        runLock.unlock()
+
+        while true {
+            runLock.lock()
+            let isRunning = running
+            runLock.unlock()
+            guard isRunning else { break }
+
             do {
                 // Read the 4-byte interleaved frame header: $ | channel | length(2)
-                let header = try await transport.receive(minimumLength: 4, maximumLength: 4)
+                let header: Data
+                if let seed = pendingSeed, seed.count >= 4 {
+                    header = seed.prefix(4)
+                    let remaining = seed.dropFirst(4)
+                    pendingSeed = remaining.isEmpty ? nil : Data(remaining)
+                } else {
+                    // If seed has < 4 bytes, prepend them to the next transport read
+                    if let seed = pendingSeed, !seed.isEmpty {
+                        var combined = seed
+                        let chunk = try await transport.receive(minimumLength: 1, maximumLength: 4 - seed.count)
+                        combined.append(chunk)
+                        pendingSeed = nil
+                        if combined.count < 4 {
+                            let more = try await transport.receive(minimumLength: 4 - combined.count, maximumLength: 4 - combined.count)
+                            combined.append(more)
+                        }
+                        header = combined.prefix(4)
+                        if combined.count > 4 {
+                            pendingSeed = Data(combined.dropFirst(4))
+                        }
+                    } else {
+                        header = try await transport.receive(minimumLength: 4, maximumLength: 4)
+                    }
+                }
                 guard header.count == 4 else { continue }
 
                 // Validate magic byte (Req 2.1)
@@ -108,10 +174,29 @@ final class RtpDemuxer {
                 }
 
                 // Read the payload
-                let payload = try await transport.receive(
-                    minimumLength: Int(length),
-                    maximumLength: Int(length)
-                )
+                let payload: Data
+                if let seed = pendingSeed, !seed.isEmpty {
+                    if seed.count >= Int(length) {
+                        payload = Data(seed.prefix(Int(length)))
+                        let remaining = seed.dropFirst(Int(length))
+                        pendingSeed = remaining.isEmpty ? nil : Data(remaining)
+                    } else {
+                        var combined = seed
+                        pendingSeed = nil
+                        let needed = Int(length) - combined.count
+                        let chunk = try await transport.receive(
+                            minimumLength: needed,
+                            maximumLength: needed
+                        )
+                        combined.append(chunk)
+                        payload = combined
+                    }
+                } else {
+                    payload = try await transport.receive(
+                        minimumLength: Int(length),
+                        maximumLength: Int(length)
+                    )
+                }
 
                 switch channel {
                 case 0:
@@ -125,7 +210,9 @@ final class RtpDemuxer {
             } catch {
                 // Transport closed or errored — exit the loop cleanly (Req: graceful close)
                 os_log("RtpDemuxer: read loop exiting: %{public}@", log: log, type: .info, error.localizedDescription)
+                runLock.lock()
                 running = false
+                runLock.unlock()
             }
         }
     }
@@ -176,7 +263,16 @@ final class RtpDemuxer {
 
         // Update statistics
         stats.ssrc = ssrc
-        stats.highestSeq = seqNum
+
+        // Detect 16-bit sequence number wraparound (Defect 1.28)
+        if let last = lastSeq {
+            let lastLow = last & 0xFFFF
+            if seqNum < lastLow && (lastLow - seqNum) > 0x8000 {
+                seqCycles += 1
+            }
+        }
+
+        stats.highestSeq = (seqCycles << 16) | seqNum
         stats.packetCount += 1
         stats.octetCount += UInt32(payload.count)
         onRtpStats?(stats)

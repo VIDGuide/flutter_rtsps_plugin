@@ -1,4 +1,5 @@
 import Foundation
+import os.log
 
 // MARK: - SdpVideoTrack
 
@@ -26,6 +27,8 @@ struct SdpVideoTrack {
 /// Requirements: 7.1, 7.2, 7.3, 7.4
 enum SdpParser {
 
+    private static let log = OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin", category: "SdpParser")
+
     /// Parses an SDP string and returns the video track parameters.
     ///
     /// - Parameter sdp: The raw SDP body from a DESCRIBE response.
@@ -47,6 +50,12 @@ enum SdpParser {
             // Detect media section boundaries
             if line.hasPrefix("m=") {
                 if line.hasPrefix("m=video") {
+                    if foundVideoSection {
+                        // Already found a video track — log warning and skip (Defect 1.33)
+                        os_log("SdpParser: multiple m=video sections found, using first track", log: log, type: .default)
+                        inVideoSection = false
+                        continue
+                    }
                     inVideoSection = true
                     foundVideoSection = true
                 } else {

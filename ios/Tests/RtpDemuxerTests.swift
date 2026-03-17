@@ -1,4 +1,5 @@
 import XCTest
+@testable import flutter_rtsps_plugin
 
 // RtpDemuxer, RtpStats, RtspTransport, and RtspError are defined in the
 // plugin's Classes/ directory. Add them to the test target's compile sources.
