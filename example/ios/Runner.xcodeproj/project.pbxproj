@@ -20,6 +20,12 @@
 		AA000002AAAA000200000001 /* RtpDemuxerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000002AAAA000200000002 /* RtpDemuxerTests.swift */; };
 		AA000003AAAA000300000001 /* BugConditionExplorationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000003AAAA000300000002 /* BugConditionExplorationTests.swift */; };
 		AA000004AAAA000400000001 /* PreservationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000004AAAA000400000002 /* PreservationTests.swift */; };
+		AA000005AAAA000500000001 /* JitterBufferConfigPropertyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000005AAAA000500000002 /* JitterBufferConfigPropertyTests.swift */; };
+		AA000006AAAA000600000001 /* AccessUnitAssemblerPropertyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000006AAAA000600000002 /* AccessUnitAssemblerPropertyTests.swift */; };
+		AA000007AAAA000700000001 /* JitterBufferPropertyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000007AAAA000700000002 /* JitterBufferPropertyTests.swift */; };
+		AA000008AAAA000800000001 /* RtpDemuxerPropertyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000008AAAA000800000002 /* RtpDemuxerPropertyTests.swift */; };
+		AA000009AAAA000900000001 /* H264DecoderPropertyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA000009AAAA000900000002 /* H264DecoderPropertyTests.swift */; };
+		AA00000AAAAA000A00000001 /* ReconnectionManagerPropertyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AA00000AAAAA000A00000002 /* ReconnectionManagerPropertyTests.swift */; };
 		ED32FFF27786DDC79BDDB545 /* Pods_RunnerTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6EFA28998A9D5003AB097A72 /* Pods_RunnerTests.framework */; };
 /* End PBXBuildFile section */
 
@@ -71,6 +77,12 @@
 		AA000002AAAA000200000002 /* RtpDemuxerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RtpDemuxerTests.swift; path = ../../../ios/Tests/RtpDemuxerTests.swift; sourceTree = "<group>"; };
 		AA000003AAAA000300000002 /* BugConditionExplorationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = BugConditionExplorationTests.swift; path = ../../../ios/Tests/BugConditionExplorationTests.swift; sourceTree = "<group>"; };
 		AA000004AAAA000400000002 /* PreservationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PreservationTests.swift; path = ../../../ios/Tests/PreservationTests.swift; sourceTree = "<group>"; };
+		AA000005AAAA000500000002 /* JitterBufferConfigPropertyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = JitterBufferConfigPropertyTests.swift; path = ../../../ios/Tests/JitterBufferConfigPropertyTests.swift; sourceTree = "<group>"; };
+		AA000006AAAA000600000002 /* AccessUnitAssemblerPropertyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AccessUnitAssemblerPropertyTests.swift; path = ../../../ios/Tests/AccessUnitAssemblerPropertyTests.swift; sourceTree = "<group>"; };
+		AA000007AAAA000700000002 /* JitterBufferPropertyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = JitterBufferPropertyTests.swift; path = ../../../ios/Tests/JitterBufferPropertyTests.swift; sourceTree = "<group>"; };
+		AA000008AAAA000800000002 /* RtpDemuxerPropertyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RtpDemuxerPropertyTests.swift; path = ../../../ios/Tests/RtpDemuxerPropertyTests.swift; sourceTree = "<group>"; };
+		AA000009AAAA000900000002 /* H264DecoderPropertyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = H264DecoderPropertyTests.swift; path = ../../../ios/Tests/H264DecoderPropertyTests.swift; sourceTree = "<group>"; };
+		AA00000AAAAA000A00000002 /* ReconnectionManagerPropertyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = ReconnectionManagerPropertyTests.swift; path = ../../../ios/Tests/ReconnectionManagerPropertyTests.swift; sourceTree = "<group>"; };
 		AD695EB376A42489C7E9E534 /* Pods-RunnerTests.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-RunnerTests.debug.xcconfig"; path = "Target Support Files/Pods-RunnerTests/Pods-RunnerTests.debug.xcconfig"; sourceTree = "<group>"; };
 		CA2A54039D0998E8AB2E1E10 /* Pods_Runner.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_Runner.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		D29831E7C4F768112BEAFCB4 /* Pods-RunnerTests.profile.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-RunnerTests.profile.xcconfig"; path = "Target Support Files/Pods-RunnerTests/Pods-RunnerTests.profile.xcconfig"; sourceTree = "<group>"; };
@@ -105,6 +117,12 @@
 				AA000002AAAA000200000002 /* RtpDemuxerTests.swift */,
 				AA000003AAAA000300000002 /* BugConditionExplorationTests.swift */,
 				AA000004AAAA000400000002 /* PreservationTests.swift */,
+				AA000005AAAA000500000002 /* JitterBufferConfigPropertyTests.swift */,
+				AA000006AAAA000600000002 /* AccessUnitAssemblerPropertyTests.swift */,
+				AA000007AAAA000700000002 /* JitterBufferPropertyTests.swift */,
+				AA000008AAAA000800000002 /* RtpDemuxerPropertyTests.swift */,
+				AA000009AAAA000900000002 /* H264DecoderPropertyTests.swift */,
+				AA00000AAAAA000A00000002 /* ReconnectionManagerPropertyTests.swift */,
 			);
 			path = RunnerTests;
 			sourceTree = "<group>";
@@ -191,6 +209,7 @@
 				331C807D294A63A400263BE5 /* Sources */,
 				331C807F294A63A400263BE5 /* Resources */,
 				3FB3C89886CABBA3C3A9D293 /* Frameworks */,
+				5BC427C326E8DBF210214D9E /* [CP] Embed Pods Frameworks */,
 			);
 			buildRules = (
 			);
@@ -340,6 +359,23 @@
 			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-frameworks.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
+		5BC427C326E8DBF210214D9E /* [CP] Embed Pods Frameworks */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-RunnerTests/Pods-RunnerTests-frameworks-${CONFIGURATION}-input-files.xcfilelist",
+			);
+			name = "[CP] Embed Pods Frameworks";
+			outputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-RunnerTests/Pods-RunnerTests-frameworks-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-RunnerTests/Pods-RunnerTests-frameworks.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
 		78FB9C1569CC867DC1FF0E0E /* [CP] Check Pods Manifest.lock */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
@@ -389,6 +425,12 @@
 				AA000002AAAA000200000001 /* RtpDemuxerTests.swift in Sources */,
 				AA000003AAAA000300000001 /* BugConditionExplorationTests.swift in Sources */,
 				AA000004AAAA000400000001 /* PreservationTests.swift in Sources */,
+				AA000005AAAA000500000001 /* JitterBufferConfigPropertyTests.swift in Sources */,
+				AA000006AAAA000600000001 /* AccessUnitAssemblerPropertyTests.swift in Sources */,
+				AA000007AAAA000700000001 /* JitterBufferPropertyTests.swift in Sources */,
+				AA000008AAAA000800000001 /* RtpDemuxerPropertyTests.swift in Sources */,
+				AA000009AAAA000900000001 /* H264DecoderPropertyTests.swift in Sources */,
+				AA00000AAAAA000A00000001 /* ReconnectionManagerPropertyTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

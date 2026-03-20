@@ -30,6 +30,12 @@ final class FlutterTextureOutput: NSObject, FlutterTexture {
     private weak var textureRegistry: FlutterTextureRegistry?
     private var latestPixelBuffer: CVPixelBuffer?
     private var _lock = os_unfair_lock()
+    /// True when a `textureFrameAvailable` call has been dispatched to the main
+    /// thread but hasn't executed yet. Prevents a bursty decoder (e.g. catching
+    /// up after a stall) from flooding the main-thread dispatch queue with
+    /// redundant notifications, which would starve other texture instances
+    /// sharing the same main-thread run loop.
+    private var pendingTextureNotification = false
     private let log = OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin",
                             category: "FlutterTextureOutput")
 
@@ -74,17 +80,34 @@ final class FlutterTextureOutput: NSObject, FlutterTexture {
 
     /// Called by `H264Decoder`'s `onPixelBuffer` callback when a decoded frame
     /// is ready. Stores the buffer and notifies Flutter on the main thread. (Req 5.2, 5.5)
+    ///
+    /// Uses a coalescing flag (`pendingTextureNotification`) so that if multiple
+    /// frames arrive before the main thread processes the notification, only one
+    /// `textureFrameAvailable` call is enqueued. This prevents a bursty stream
+    /// (catching up after a jitter/stall) from flooding the main-thread dispatch
+    /// queue and delaying texture notifications for other concurrent streams.
     func onNewFrame(_ pixelBuffer: CVPixelBuffer) {
-        withLock { latestPixelBuffer = pixelBuffer }
+        let shouldNotify = withLock {
+            latestPixelBuffer = pixelBuffer
+            if pendingTextureNotification {
+                // A notification is already queued — it will pick up this newer buffer.
+                return false
+            }
+            pendingTextureNotification = true
+            return true
+        }
 
-        // textureFrameAvailable MUST be called on the main thread (Req 5.5)
+        guard shouldNotify else { return }
+
         let id = textureId
         let registry = textureRegistry
         if Thread.isMainThread {
             registry?.textureFrameAvailable(id)
+            withLock { pendingTextureNotification = false }
         } else {
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
                 registry?.textureFrameAvailable(id)
+                self?.withLock { self?.pendingTextureNotification = false }
             }
         }
     }
@@ -120,6 +143,7 @@ final class FlutterTextureOutput: NSObject, FlutterTexture {
             let reg = textureRegistry
             let tid = textureId
             latestPixelBuffer = nil
+            pendingTextureNotification = false
             textureRegistry = nil
             return (reg, tid)
         }

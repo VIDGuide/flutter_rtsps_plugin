@@ -35,7 +35,7 @@ final class RtpDemuxer {
     /// Called with each extracted NAL unit and a flag indicating whether the
     /// RTP marker bit was set (i.e. the access unit / frame is complete).
     /// (Req 2.4, 2.5, 2.7)
-    var onNalUnit: ((Data, Bool) -> Void)?
+    var onNalUnit: ((RtpNalUnit) -> Void)?
 
     /// Called with each raw RTCP packet payload. (Req 2.3)
     var onRtcpPacket: ((Data) -> Void)?
@@ -80,6 +80,16 @@ final class RtpDemuxer {
 
     /// Counter for throttling "FU-A without start" log messages.
     private var fuaNoStartLogCount: UInt32 = 0
+
+    /// The sequence number of the RTP packet that started the current FU-A
+    /// reassembly (the start fragment). Used for diagnostic logging when a
+    /// sequence gap forces a discard. (Req 3.1)
+    private var fuaStartSeq: UInt32? = nil
+
+    /// The expected next sequence number during FU-A reassembly. Set to
+    /// `lastSeq + 1` after each FU-A fragment so the next fragment can be
+    /// validated as exactly consecutive. (Req 3.2)
+    private var fuaExpectedSeq: UInt32? = nil
 
     /// Maximum size of a reassembled FU-A NAL unit (2 MB). Buffers exceeding
     /// this are discarded to prevent unbounded memory growth on bad streams.
@@ -145,6 +155,8 @@ final class RtpDemuxer {
         runLock.lock()
         running = false
         fuaBuffer = nil
+        fuaStartSeq = nil
+        fuaExpectedSeq = nil
         lastSeq = nil
         seqCycles = 0
         gapLogCount = 0
@@ -391,16 +403,13 @@ final class RtpDemuxer {
 
         // Detect sequence number discontinuity during FU-A reassembly.
         //
-        // UDP transport can deliver duplicate packets, minor reordering,
-        // and small gaps from WiFi packet loss. Strategy:
+        // Strategy (Req 3.2, 3.3):
         //   1. Duplicate (seqNum == lastSeq): silently drop.
-        //   2. Late/reordered (seqNum < expected, small delta): drop packet,
-        //      keep FU-A buffer intact.
-        //   3. Small forward gap (1-3 packets): continue FU-A reassembly.
-        //      VideoToolbox handles minor corruption better than a fully
-        //      dropped frame (which causes cascading P-frame glitches).
-        //   4. Large forward gap (4+ packets): discard FU-A buffer — too
-        //      much data is missing for a usable frame.
+        //   2. Late/reordered (seqNum < expected, large forward distance
+        //      wrapping around): drop packet, keep FU-A buffer intact.
+        //   3. ANY forward gap: discard FU-A reassembly buffer entirely.
+        //      Strict sequence validation ensures no corrupt NALs are
+        //      forwarded to the decoder.
         if let last = lastSeq {
             let expected = (last + 1) & 0xFFFF
             if seqNum == last {
@@ -419,27 +428,16 @@ final class RtpDemuxer {
                     // don't destroy the FU-A buffer.
                     return
                 }
-                // Forward gap — genuine discontinuity.
+                // Forward gap — genuine discontinuity. ANY gap discards
+                // the FU-A buffer (Req 3.3).
                 gapLogCount += 1
                 if fuaBuffer != nil {
-                    if forwardDist <= 3 {
-                        // Small gap: continue reassembly. The missing fragment(s)
-                        // will cause minor corruption in this NAL unit but
-                        // VideoToolbox can usually decode it. Much better than
-                        // dropping the entire frame and causing cascading
-                        // reference frame errors on subsequent P-frames.
-                        if gapLogCount <= 5 || gapLogCount % 200 == 0 {
-                            os_log("RtpDemuxer: small seq gap (%u → %u, missing %u), continuing FU-A [gaps=%u]",
-                                   log: log, type: .default, last, seqNum, forwardDist, gapLogCount)
-                        }
-                    } else {
-                        // Large gap: too much data missing, discard buffer.
-                        if gapLogCount <= 5 || gapLogCount % 200 == 0 {
-                            os_log("RtpDemuxer: large seq gap (%u → %u, missing %u), discarding FU-A [gaps=%u]",
-                                   log: log, type: .default, last, seqNum, forwardDist, gapLogCount)
-                        }
-                        fuaBuffer = nil
-                    }
+                    os_log("RtpDemuxer: seq gap during FU-A reassembly (expected %u, received %u, started at %u), discarding buffer [gaps=%u]",
+                           log: log, type: .fault,
+                           expected, seqNum, fuaStartSeq ?? 0, gapLogCount)
+                    fuaBuffer = nil
+                    fuaStartSeq = nil
+                    fuaExpectedSeq = nil
                 }
             }
         }
@@ -469,7 +467,12 @@ final class RtpDemuxer {
             handleStapA(payload: payload, markerBit: markerBit)
         default:
             // Single NAL unit packet — forward directly
-            onNalUnit?(payload, markerBit)
+            onNalUnit?(RtpNalUnit(
+                data: payload,
+                isFrameComplete: markerBit,
+                rtpTimestamp: stats.rtpTimestamp,
+                sequenceNumber: UInt16(truncatingIfNeeded: lastSeq ?? 0)
+            ))
         }
     }
 
@@ -503,7 +506,12 @@ final class RtpDemuxer {
             let isLast = i == nalUnits.index(before: nalUnits.endIndex)
             // Only set the marker bit on the last NAL unit — it signals
             // end-of-access-unit to the decoder's accumulation logic.
-            onNalUnit?(nal, isLast && markerBit)
+            onNalUnit?(RtpNalUnit(
+                data: nal,
+                isFrameComplete: isLast && markerBit,
+                rtpTimestamp: stats.rtpTimestamp,
+                sequenceNumber: UInt16(truncatingIfNeeded: lastSeq ?? 0)
+            ))
         }
     }
 
@@ -540,6 +548,11 @@ final class RtpDemuxer {
     ///
     /// FU indicator byte: forbidden_zero(1) NRI(2) type=28(5)
     /// FU header byte:    S(1) E(1) R(1) nal_type(5)
+    ///
+    /// Strict sequence validation (Req 3.1, 3.2, 3.3):
+    /// - Start fragment records `fuaStartSeq` and `fuaExpectedSeq`.
+    /// - Each continuation/end fragment validates `lastSeq == fuaExpectedSeq`.
+    /// - ANY mismatch discards the entire reassembly buffer.
     private func handleFuA(payload: Data, markerBit: Bool) {
         guard payload.count >= 2 else {
             os_log("RtpDemuxer: FU-A packet too short", log: log, type: .error)
@@ -556,18 +569,44 @@ final class RtpDemuxer {
         let fragment = payload[2...]
 
         if isStart {
+            // If there's an existing reassembly in progress, a new start
+            // fragment means the previous one was incomplete — discard it (Req 3.5).
+            if fuaBuffer != nil {
+                os_log("RtpDemuxer: FU-A start during active reassembly (started at seq %u), discarding incomplete buffer",
+                       log: log, type: .fault, fuaStartSeq ?? 0)
+            }
+            // Record starting sequence number for this FU-A reassembly (Req 3.1)
+            fuaStartSeq = lastSeq
+            fuaExpectedSeq = ((lastSeq ?? 0) + 1) & 0xFFFF
+
             // Reconstruct the NAL header: (FU_indicator & 0xE0) | nal_type
             let nalHeader = (fuIndicator & 0xE0) | nalType
             fuaBuffer = Data([nalHeader])
             fuaBuffer?.append(contentsOf: fragment)
         } else if var buf = fuaBuffer {
+            // Continuation or end fragment — validate strict sequence (Req 3.2, 3.3)
+            if let expectedSeq = fuaExpectedSeq, lastSeq != expectedSeq {
+                os_log("RtpDemuxer: FU-A sequence break (expected %u, received %u, started at %u), discarding buffer",
+                       log: log, type: .fault,
+                       expectedSeq, lastSeq ?? 0, fuaStartSeq ?? 0)
+                fuaBuffer = nil
+                fuaStartSeq = nil
+                fuaExpectedSeq = nil
+                return
+            }
+
+            // Advance expected sequence for the next fragment
+            fuaExpectedSeq = ((lastSeq ?? 0) + 1) & 0xFFFF
+
             buf.append(contentsOf: fragment)
 
-            // Guard against unbounded accumulation on malformed/corrupt streams
+            // Guard against unbounded accumulation on malformed/corrupt streams (Req 3.6)
             if buf.count > RtpDemuxer.maxFuaBufferSize {
                 os_log("RtpDemuxer: FU-A buffer exceeded %d bytes, discarding",
                        log: log, type: .error, RtpDemuxer.maxFuaBufferSize)
                 fuaBuffer = nil
+                fuaStartSeq = nil
+                fuaExpectedSeq = nil
                 return
             }
 
@@ -575,15 +614,22 @@ final class RtpDemuxer {
 
             if isEnd {
                 // Complete NAL unit assembled — forward it
-                onNalUnit?(fuaBuffer!, markerBit)
+                onNalUnit?(RtpNalUnit(
+                    data: fuaBuffer!,
+                    isFrameComplete: markerBit,
+                    rtpTimestamp: stats.rtpTimestamp,
+                    sequenceNumber: UInt16(truncatingIfNeeded: lastSeq ?? 0)
+                ))
                 fuaBuffer = nil
+                fuaStartSeq = nil
+                fuaExpectedSeq = nil
             }
         } else {
-            // Middle/end fragment arrived without a start — discard
+            // Middle/end fragment arrived without a start — discard (Req 3.4)
             fuaNoStartLogCount += 1
             if fuaNoStartLogCount <= 3 || fuaNoStartLogCount % 100 == 0 {
                 os_log("RtpDemuxer: FU-A fragment without start, discarding [count=%u]",
-                       log: log, type: .default, fuaNoStartLogCount)
+                       log: log, type: .fault, fuaNoStartLogCount)
             }
         }
     }

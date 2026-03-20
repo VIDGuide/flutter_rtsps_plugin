@@ -121,9 +121,9 @@ final class PreservationTests: XCTestCase {
 
         var receivedNal: Data?
         var receivedMarker: Bool?
-        demuxer.onNalUnit = { nal, marker in
-            receivedNal = nal
-            receivedMarker = marker
+        demuxer.onNalUnit = { unit in
+            receivedNal = unit.data
+            receivedMarker = unit.isFrameComplete
         }
 
         demuxer.processRtpPacketForTesting(Data(rtp1))
@@ -169,8 +169,8 @@ final class PreservationTests: XCTestCase {
         let rtp = rtpHeader(marker: true, seq: 1) + stapPayload
 
         var receivedNals: [(Data, Bool)] = []
-        demuxer.onNalUnit = { nal, marker in
-            receivedNals.append((nal, marker))
+        demuxer.onNalUnit = { unit in
+            receivedNals.append((unit.data, unit.isFrameComplete))
         }
 
         demuxer.processRtpPacketForTesting(Data(rtp))
@@ -194,9 +194,9 @@ final class PreservationTests: XCTestCase {
 
         var receivedNal: Data?
         var receivedMarker: Bool?
-        demuxer.onNalUnit = { nal, marker in
-            receivedNal = nal
-            receivedMarker = marker
+        demuxer.onNalUnit = { unit in
+            receivedNal = unit.data
+            receivedMarker = unit.isFrameComplete
         }
 
         demuxer.processRtpPacketForTesting(Data(rtp))
@@ -331,7 +331,7 @@ final class PreservationTests: XCTestCase {
         let demuxer = RtpDemuxer(transport: makeDummyTransport())
 
         var nalCount = 0
-        demuxer.onNalUnit = { _, _ in nalCount += 1 }
+        demuxer.onNalUnit = { _ in nalCount += 1 }
 
         // Before any packets, no NAL units should have been emitted
         XCTAssertEqual(nalCount, 0)
@@ -396,7 +396,7 @@ final class PreservationTests: XCTestCase {
 
         for nalType in singleNalTypes {
             var callCount = 0
-            demuxer.onNalUnit = { _, _ in callCount += 1 }
+            demuxer.onNalUnit = { _ in callCount += 1 }
 
             let nalPayload: [UInt8] = [nalType | 0x60, 0xAA, 0xBB] // NRI=3 + type
             let rtp = rtpHeader(marker: true, seq: UInt16(nalType)) + nalPayload

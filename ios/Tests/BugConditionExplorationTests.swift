@@ -50,7 +50,7 @@ final class BugConditionExplorationTests: XCTestCase {
         let demuxer = RtpDemuxer(transport: makeDummyTransport())
 
         var nalCount = 0
-        demuxer.onNalUnit = { _, _ in nalCount += 1 }
+        demuxer.onNalUnit = { _ in nalCount += 1 }
 
         // Feed a FU-A start fragment to populate fuaBuffer
         let fuIndicator: UInt8 = 0x7C // NRI=3, type=28
@@ -98,7 +98,7 @@ final class BugConditionExplorationTests: XCTestCase {
 
         var lastStats: RtpStats?
         demuxer.onRtpStats = { stats in lastStats = stats }
-        demuxer.onNalUnit = { _, _ in }
+        demuxer.onNalUnit = { _ in }
 
         let nalPayload: [UInt8] = [0x41, 0xAA]
 
@@ -256,7 +256,7 @@ final class BugConditionExplorationTests: XCTestCase {
 
     func testConcurrentStopCallsAreSafe() async {
         let demuxer = RtpDemuxer(transport: makeDummyTransport())
-        demuxer.onNalUnit = { _, _ in }
+        demuxer.onNalUnit = { _ in }
         demuxer.start()
 
         // Call stop() from multiple concurrent tasks
@@ -278,7 +278,7 @@ final class BugConditionExplorationTests: XCTestCase {
 
         let demuxer2 = RtpDemuxer(transport: makeDummyTransport())
         var nalCount = 0
-        demuxer2.onNalUnit = { _, _ in nalCount += 1 }
+        demuxer2.onNalUnit = { _ in nalCount += 1 }
 
         let fuIndicator: UInt8 = 0x7C
         let rtp = rtpHeader(marker: false, seq: 1)
@@ -323,7 +323,7 @@ final class BugConditionExplorationTests: XCTestCase {
     func testDuplicateStartIsRejected() {
         let demuxer = RtpDemuxer(transport: makeDummyTransport())
         var nalCount = 0
-        demuxer.onNalUnit = { _, _ in nalCount += 1 }
+        demuxer.onNalUnit = { _ in nalCount += 1 }
 
         // First start — should succeed
         demuxer.start()

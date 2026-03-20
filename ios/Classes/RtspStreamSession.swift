@@ -33,6 +33,12 @@ final class RtspStreamSession: NSObject {
     private var textureOutput: FlutterTextureOutput?
     private var udpMediaTransport: UdpMediaTransport?
 
+    // MARK: - Private — new pipeline components
+
+    private var assembler: AccessUnitAssembler?
+    private var jitterBuffer: JitterBuffer?
+    private var reconnectionManager: ReconnectionManager?
+
     // MARK: - Private — event channel
 
     private var eventChannel: FlutterEventChannel?
@@ -161,9 +167,41 @@ final class RtspStreamSession: NSObject {
 
         // Create demuxer and wire callbacks
         let demux = RtpDemuxer(transport: transport)
-        demux.onNalUnit = { [weak dec] nalUnit, isFrameComplete in
-            dec?.feedNalUnit(nalUnit, isFrameComplete: isFrameComplete)
+
+        // Create AccessUnitAssembler and JitterBuffer for the new pipeline.
+        // Transport mode: UDP if negotiated, TCP otherwise.
+        let transportMode: TransportMode = handshakeResult.udpTransport != nil ? .udp : .tcp
+        let jbConfig = JitterBufferConfig(transportMode: transportMode)
+        let jb = JitterBuffer(config: jbConfig)
+        let asm = AccessUnitAssembler()
+
+        // Wire pipeline: demuxer → assembler → jitter buffer → decoder
+        demux.onNalUnit = { [weak asm] unit in
+            asm?.feedNalUnit(unit)
         }
+        asm.onAccessUnit = { [weak jb] accessUnit in
+            jb?.enqueue(accessUnit)
+        }
+        // Accumulate SPS/PPS from the assembler and forward to decoder
+        // when both are available. The assembler emits them individually.
+        var pendingSps: Data?
+        var pendingPps: Data?
+        asm.onParameterSet = { [weak dec] data, nalType in
+            switch nalType {
+            case 7: pendingSps = data
+            case 8: pendingPps = data
+            default: break
+            }
+            if let sps = pendingSps, let pps = pendingPps {
+                dec?.updateParameterSets(sps: sps, pps: pps)
+                pendingSps = nil
+                pendingPps = nil
+            }
+        }
+        jb.onReleaseFrame = { [weak dec] accessUnit in
+            dec?.decodeAccessUnit(accessUnit.nalUnits)
+        }
+
         demux.onRtcpPacket = { [weak rtcp] data in
             rtcp?.processRtcpPacket(data)
         }
@@ -171,6 +209,8 @@ final class RtspStreamSession: NSObject {
             rtcp?.updateStats(stats)
         }
         self.demuxer = demux
+        self.assembler = asm
+        self.jitterBuffer = jb
 
         // Check if UDP transport was negotiated
         if let udpInfo = handshakeResult.udpTransport {
@@ -221,6 +261,27 @@ final class RtspStreamSession: NSObject {
 
         // Start RTCP sender (works for both UDP and TCP paths)
         rtcp.start()
+
+        // Start jitter buffer release timer after pipeline is fully wired
+        jb.start()
+
+        // Create and start ReconnectionManager (Req 7.1)
+        let rm = ReconnectionManager()
+        rm.onReconnect = { [weak self] in
+            try await self?.performReconnection()
+        }
+        rm.onReconnectFailed = { [weak self] error in
+            self?.handleError(error)
+        }
+        rm.start()
+        self.reconnectionManager = rm
+
+        // SDP diagnostic logging (Req 11.1, 11.2)
+        os_log("RtspStreamSession[%d]: SDP summary — codec: H264, control: %{public}@, SPS/PPS: %{public}@, transport: %{public}@",
+               log: log, type: .info, streamId,
+               videoTrack.controlUrl,
+               videoTrack.sps != nil ? "from SDP" : "awaiting in-band",
+               transportMode == .udp ? "UDP" : "TCP")
 
         os_log("RtspStreamSession[%d]: streaming started, textureId=%lld",
                log: log, type: .info, streamId, textureOut.textureId)
@@ -276,25 +337,34 @@ final class RtspStreamSession: NSObject {
     // MARK: - Private — teardown sequence
 
     private func performStop() async {
-        // 1. Teardown RTSP (sends TEARDOWN + closes transport)
+        // 1. Stop ReconnectionManager first (prevents new reconnection during teardown)
+        reconnectionManager?.stop()
+
+        // 2. Stop JitterBuffer release timer
+        jitterBuffer?.stop()
+
+        // 3. Teardown RTSP (sends TEARDOWN + closes transport)
         await stateMachine?.teardown()
 
-        // 2. Stop RTCP timer
+        // 4. Stop RTCP timer
         rtcpSender?.stop()
 
-        // 3. Stop demuxer read loop
+        // 5. Stop demuxer read loop
         demuxer?.stop()
 
-        // 3b. Stop UDP media transport if active
+        // 5b. Stop UDP media transport if active
         udpMediaTransport?.stop()
 
-        // 4. Stop decoder (invalidates VTDecompressionSession)
+        // 6. Flush assembler
+        assembler?.flush()
+
+        // 7. Stop decoder (invalidates VTDecompressionSession)
         decoder?.stop()
 
-        // 5. Unregister texture
+        // 8. Unregister texture
         textureOutput?.stop()
 
-        // 6. Nil component references so late-firing callbacks find nil (Defect 1.20)
+        // 9. Nil component references so late-firing callbacks find nil (Defect 1.20)
         transport = nil
         stateMachine = nil
         demuxer = nil
@@ -302,12 +372,159 @@ final class RtspStreamSession: NSObject {
         decoder = nil
         textureOutput = nil
         udpMediaTransport = nil
+        assembler = nil
+        jitterBuffer = nil
+        reconnectionManager = nil
 
-        // 7. Clean up event channel (Defect 1.21)
+        // 10. Clean up event channel (Defect 1.21)
         await MainActor.run {
             eventChannel?.setStreamHandler(nil)
             eventChannel = nil
         }
+    }
+
+    // MARK: - Private — reconnection (Req 7.1, 7.2, 7.3, 7.4)
+
+    /// Performs a full pipeline swap: detaches old assembler, creates new
+    /// transport/handshake/demuxer/assembler, resets jitter buffer, wires
+    /// new assembler, and tears down old pipeline.
+    private func performReconnection() async throws {
+        os_log("RtspStreamSession[%d]: reconnection starting", log: log, type: .info, streamId)
+
+        // Detach old assembler so it stops feeding the jitter buffer
+        let oldAssembler = assembler
+        oldAssembler?.onAccessUnit = nil
+
+        let oldDemuxer = demuxer
+        let oldTransport = transport
+        let oldStateMachine = stateMachine
+        let oldRtcpSender = rtcpSender
+        let oldUdpTransport = udpMediaTransport
+
+        // Build new transport + state machine
+        let newTransport = RtspTransport()
+
+        guard let newSm = try? RtspStateMachine(
+            transport: newTransport,
+            url: url,
+            username: username,
+            password: password
+        ) else {
+            throw RtspError.connectionFailed("Invalid RTSP URL during reconnection")
+        }
+
+        // Connect new transport
+        guard let parsed = URL(string: url), let host = parsed.host else {
+            throw RtspError.connectionFailed("Invalid RTSP URL during reconnection")
+        }
+        let defaultPort = parsed.scheme?.lowercased() == "rtsps" ? 322 : 554
+        let port = UInt16(parsed.port ?? defaultPort)
+        try await newTransport.connect(host: host, port: port)
+
+        // Run handshake on new connection
+        let handshakeResult = try await newSm.runHandshake()
+        let videoTrack = handshakeResult.videoTrack
+
+        // Initialize decoder with new SPS/PPS if available
+        if let sps = videoTrack.sps, let pps = videoTrack.pps {
+            decoder?.updateParameterSets(sps: sps, pps: pps)
+        }
+
+        // Create new RTCP sender
+        let newRtcp = RtcpSender(transport: newTransport) { [weak self] error in
+            self?.handleError(error)
+        }
+
+        // Create new demuxer
+        let newDemux = RtpDemuxer(transport: newTransport)
+
+        // Create new assembler
+        let newAsm = AccessUnitAssembler()
+
+        // Wire new pipeline
+        newDemux.onNalUnit = { [weak newAsm] unit in
+            newAsm?.feedNalUnit(unit)
+        }
+
+        // Reset jitter buffer at the swap point (flush stale frames)
+        jitterBuffer?.reset()
+
+        // Wire new assembler to existing jitter buffer
+        let jb = jitterBuffer
+        let dec = decoder
+        newAsm.onAccessUnit = { [weak jb] accessUnit in
+            jb?.enqueue(accessUnit)
+        }
+        var pendingSps: Data?
+        var pendingPps: Data?
+        newAsm.onParameterSet = { [weak dec] data, nalType in
+            switch nalType {
+            case 7: pendingSps = data
+            case 8: pendingPps = data
+            default: break
+            }
+            if let sps = pendingSps, let pps = pendingPps {
+                dec?.updateParameterSets(sps: sps, pps: pps)
+                pendingSps = nil
+                pendingPps = nil
+            }
+        }
+
+        newDemux.onRtcpPacket = { [weak newRtcp] data in
+            newRtcp?.processRtcpPacket(data)
+        }
+        newDemux.onRtpStats = { [weak newRtcp] stats in
+            newRtcp?.updateStats(stats)
+        }
+
+        // Handle UDP vs TCP for new connection
+        if let udpInfo = handshakeResult.udpTransport {
+            let newUdp = UdpMediaTransport(info: udpInfo)
+            newUdp.onRtpPacket = { [weak newDemux] packet in
+                newDemux?.feedRtpPacket(packet)
+            }
+            newUdp.onRtcpPacket = { [weak newRtcp] data in
+                newRtcp?.processRtcpPacket(data)
+            }
+            newUdp.onError = { [weak self] error in
+                self?.handleError(error)
+            }
+            newRtcp.udpSendHandler = { [weak newUdp] data in
+                newUdp?.sendRtcp(data)
+            }
+            try newUdp.start()
+            self.udpMediaTransport = newUdp
+
+            newDemux.drainOnly = true
+            if let leftover = handshakeResult.remainingData {
+                newDemux.seedData(leftover)
+            }
+            newDemux.start()
+        } else {
+            if let leftover = handshakeResult.remainingData {
+                newDemux.seedData(leftover)
+            }
+            newDemux.start()
+        }
+
+        newRtcp.start()
+
+        // Swap references
+        self.transport = newTransport
+        self.stateMachine = newSm
+        self.demuxer = newDemux
+        self.rtcpSender = newRtcp
+        self.assembler = newAsm
+
+        // Tear down old pipeline
+        oldRtcpSender?.stop()
+        oldDemuxer?.stop()
+        oldUdpTransport?.stop()
+        oldAssembler?.flush()
+        await oldStateMachine?.teardown()
+        oldTransport?.close()
+
+        os_log("RtspStreamSession[%d]: reconnection complete", log: log, type: .info, streamId)
     }
 
     // MARK: - Private — first frame

@@ -36,7 +36,17 @@ final class RtcpSender {
     var udpSendHandler: ((Data) -> Void)?
 
     private var timer: DispatchSourceTimer?
-    private let timerQueue = DispatchQueue(label: "com.pandawatch.flutter_rtsps_plugin.rtcp")
+    private let timerQueue: DispatchQueue
+
+    /// Unique instance counter for queue labelling.
+    private static let counterLock = NSLock()
+    private static var instanceCounter: Int = 0
+    private static func nextId() -> Int {
+        counterLock.lock()
+        defer { counterLock.unlock() }
+        instanceCounter += 1
+        return instanceCounter
+    }
 
     /// Guards against overlapping sends if a send takes longer than the 1-second interval.
     /// Only accessed on `timerQueue`.
@@ -128,6 +138,8 @@ final class RtcpSender {
     init(transport: RtspTransport, onError: @escaping (Error) -> Void) {
         self.transport = transport
         self.onError = onError
+        let id = RtcpSender.nextId()
+        self.timerQueue = DispatchQueue(label: "com.pandawatch.flutter_rtsps_plugin.rtcp.\(id)")
     }
 
     // MARK: - Stats Update

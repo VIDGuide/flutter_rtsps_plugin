@@ -50,9 +50,9 @@ final class RtpDemuxerTests: XCTestCase {
 
         var receivedNal: Data?
         var receivedMarker: Bool?
-        demuxer.onNalUnit = { nal, marker in
-            receivedNal = nal
-            receivedMarker = marker
+        demuxer.onNalUnit = { unit in
+            receivedNal = unit.data
+            receivedMarker = unit.isFrameComplete
         }
 
         demuxer.processRtpPacketForTesting(Data(rtp))
@@ -69,7 +69,7 @@ final class RtpDemuxerTests: XCTestCase {
         let rtp = rtpHeader(marker: false) + nalPayload
 
         var receivedMarker: Bool?
-        demuxer.onNalUnit = { _, marker in receivedMarker = marker }
+        demuxer.onNalUnit = { unit in receivedMarker = unit.isFrameComplete }
 
         demuxer.processRtpPacketForTesting(Data(rtp))
 
@@ -101,9 +101,9 @@ final class RtpDemuxerTests: XCTestCase {
 
         var receivedNal: Data?
         var receivedMarker: Bool?
-        demuxer.onNalUnit = { nal, marker in
-            receivedNal = nal
-            receivedMarker = marker
+        demuxer.onNalUnit = { unit in
+            receivedNal = unit.data
+            receivedMarker = unit.isFrameComplete
         }
 
         demuxer.processRtpPacketForTesting(Data(rtp1))
@@ -131,7 +131,7 @@ final class RtpDemuxerTests: XCTestCase {
         let rtp = rtpHeader(marker: true, seq: 1) + [fuIndicator, 0x45, 0xAA, 0xBB]
 
         var nalEmitted = false
-        demuxer.onNalUnit = { _, _ in nalEmitted = true }
+        demuxer.onNalUnit = { _ in nalEmitted = true }
 
         demuxer.processRtpPacketForTesting(Data(rtp))
 
@@ -153,7 +153,7 @@ final class RtpDemuxerTests: XCTestCase {
         var receivedRtcp: Data?
         var nalEmitted = false
         demuxer.onRtcpPacket = { data in receivedRtcp = data }
-        demuxer.onNalUnit = { _, _ in nalEmitted = true }
+        demuxer.onNalUnit = { _ in nalEmitted = true }
 
         demuxer.dispatchPayloadForTesting(channel: 1, payload: rtcpPayload)
 
@@ -171,7 +171,7 @@ final class RtpDemuxerTests: XCTestCase {
         var rtcpEmitted = false
         var nalEmitted = false
         demuxer.onRtcpPacket = { _ in rtcpEmitted = true }
-        demuxer.onNalUnit = { _, _ in nalEmitted = true }
+        demuxer.onNalUnit = { _ in nalEmitted = true }
 
         demuxer.dispatchPayloadForTesting(channel: 0, payload: rtp)
 
@@ -218,7 +218,7 @@ final class RtpDemuxerTests: XCTestCase {
         let rtp = header + nalPayload
 
         var receivedNal: Data?
-        demuxer.onNalUnit = { nal, _ in receivedNal = nal }
+        demuxer.onNalUnit = { unit in receivedNal = unit.data }
 
         demuxer.processRtpPacketForTesting(Data(rtp))
 

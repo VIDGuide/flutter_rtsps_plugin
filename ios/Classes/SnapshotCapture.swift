@@ -168,8 +168,8 @@ final class SnapshotCapture {
         }
 
         let dmx = RtpDemuxer(transport: transport)
-        dmx.onNalUnit = { [weak dec] nalUnit, isFrameComplete in
-            dec?.feedNalUnit(nalUnit, isFrameComplete: isFrameComplete)
+        dmx.onNalUnit = { [weak dec] unit in
+            dec?.feedNalUnit(unit)
         }
         dmx.onRtpStats = { [weak rtcp] stats in
             rtcp?.updateStats(stats)

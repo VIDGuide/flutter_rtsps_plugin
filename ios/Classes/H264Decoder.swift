@@ -49,8 +49,25 @@ final class H264Decoder {
     private var activeSps: Data?
     private var activePps: Data?
 
-    private let queue = DispatchQueue(label: "com.pandawatch.flutter_rtsps_plugin.h264decoder",
-                                     qos: .userInteractive)
+    /// Counter incremented each time `initializeDecoderSync` is called.
+    /// Exposed for property testing (Property 13: SPS/PPS identity check).
+    private(set) var reinitCount: Int = 0
+
+    /// Per-instance serial queue. Uses a unique label so Instruments/os_log
+    /// can distinguish between concurrent decoder instances (e.g. two printers
+    /// streaming simultaneously). The `.userInteractive` QoS ensures decode
+    /// work is not deprioritised behind other work on the system.
+    let queue: DispatchQueue
+
+    /// Unique instance counter for queue labelling.
+    private static let counterLock = NSLock()
+    private static var instanceCounter: Int = 0
+    private static func nextId() -> Int {
+        counterLock.lock()
+        defer { counterLock.unlock() }
+        instanceCounter += 1
+        return instanceCounter
+    }
     private let log = OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin", category: "H264Decoder")
 
     // MARK: - Init
@@ -62,6 +79,11 @@ final class H264Decoder {
          onError: @escaping (Error) -> Void) {
         self.onPixelBuffer = onPixelBuffer
         self.onError = onError
+        let id = H264Decoder.nextId()
+        self.queue = DispatchQueue(
+            label: "com.pandawatch.flutter_rtsps_plugin.h264decoder.\(id)",
+            qos: .userInteractive
+        )
     }
 
     // MARK: - Decoder Initialization
@@ -84,6 +106,7 @@ final class H264Decoder {
 
     /// Internal implementation — must be called on `queue`.
     private func initializeDecoderSync(sps: Data, pps: Data) throws {
+        reinitCount += 1
         // Build the format description from SPS + PPS
         var spsBytes = [UInt8](sps)
         var ppsBytes = [UInt8](pps)
@@ -147,6 +170,46 @@ final class H264Decoder {
         os_log("H264Decoder: decoder initialized", log: log, type: .info)
     }
 
+    // MARK: - Parameter Set Update (New Pipeline Entry Point)
+
+    /// Updates the decoder's SPS/PPS parameter sets. Called by
+    /// `AccessUnitAssembler.onParameterSet` in the new pipeline.
+    ///
+    /// If the incoming SPS/PPS are byte-identical to the active ones, the
+    /// decoder session is kept as-is (no teardown/reinit). This avoids the
+    /// expensive cycle that drops pending frames and causes visible stuttering.
+    /// The Bambu H2C resends identical SPS/PPS at every keyframe (~10s).
+    ///
+    /// If different: tears down the session, discards pending NALs, and creates
+    /// a new session with the new parameter sets.
+    ///
+    /// - Parameters:
+    ///   - sps: Sequence Parameter Set data.
+    ///   - pps: Picture Parameter Set data.
+    func updateParameterSets(sps: Data, pps: Data) {
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            // Skip re-init if parameter sets haven't changed (Property 13).
+            if self.isInitialized, let aSps = self.activeSps, let aPps = self.activePps,
+               aSps == sps, aPps == pps {
+                return
+            }
+
+            // Different parameter sets — tear down and reinitialize.
+            self.pendingNalUnits = []
+            do {
+                try self.initializeDecoderSync(sps: sps, pps: pps)
+                self.activeSps = sps
+                self.activePps = pps
+            } catch {
+                os_log("H264Decoder: updateParameterSets reinit failed: %{public}@",
+                       log: self.log, type: .error, error.localizedDescription)
+                self.onError(error)
+            }
+        }
+    }
+
     // MARK: - NAL Unit Feed (main entry point)
 
     /// Main entry point called by `RtpDemuxer.onNalUnit`. Accumulates NAL
@@ -154,10 +217,13 @@ final class H264Decoder {
     ///
     /// Also detects in-band SPS (type 7) and PPS (type 8) and initializes
     /// the decoder on first occurrence if not yet initialized. (Req 4.7)
-    func feedNalUnit(_ nalUnit: Data, isFrameComplete: Bool) {
+    ///
+    /// This is the compatibility path preserved for `SnapshotCapture`, which
+    /// bypasses the jitter buffer and wires directly from demuxer to decoder.
+    func feedNalUnit(_ unit: RtpNalUnit) {
         queue.async { [weak self] in
             guard let self else { return }
-            self.feedNalUnitSync(nalUnit, isFrameComplete: isFrameComplete)
+            self.feedNalUnitSync(unit.data, isFrameComplete: unit.isFrameComplete)
         }
     }
 
@@ -193,7 +259,29 @@ final class H264Decoder {
         }
     }
 
-    // MARK: - Access Unit Decode
+    // MARK: - Access Unit Decode (New Pipeline Entry Point)
+
+    /// Decodes a complete access unit (array of NAL units) received from the
+    /// JitterBuffer's `onReleaseFrame` callback. This is the new pipeline entry
+    /// point that bypasses the internal NAL accumulation logic.
+    ///
+    /// Dispatches to the decoder's serial queue for thread safety.
+    /// - Parameter nalUnits: Pre-assembled NAL units comprising one video frame.
+    func decodeAccessUnit(_ nalUnits: [Data]) {
+        queue.async { [weak self] in
+            guard let self, self.isInitialized, !nalUnits.isEmpty else { return }
+            // Strip Annex B start codes from each NAL (defensive — the new
+            // pipeline shouldn't produce them, but the compatibility path might).
+            let stripped = nalUnits.compactMap { nal -> Data? in
+                let s = self.stripAnnexBStartCode(from: nal)
+                return s.isEmpty ? nil : s
+            }
+            guard !stripped.isEmpty else { return }
+            self.decodeNalUnits(stripped)
+        }
+    }
+
+    // MARK: - Access Unit Decode (Internal)
 
     /// Builds a `CMSampleBuffer` in AVCC format and submits it to the
     /// `VTDecompressionSession`. (Req 4.2)
@@ -427,5 +515,12 @@ private func decompressionOutputCallback(
     }
 
     guard let pixelBuffer = imageBuffer else { return }
-    decoder.onPixelBuffer(pixelBuffer)
+
+    // Dispatch the callback onto the decoder's own serial queue rather than
+    // executing it inline on VideoToolbox's shared internal thread pool.
+    // Without this, a jittering/stalling stream can saturate VT's thread pool
+    // and delay decoded-frame delivery for other concurrent decoder instances.
+    decoder.queue.async { [weak decoder] in
+        decoder?.onPixelBuffer(pixelBuffer)
+    }
 }

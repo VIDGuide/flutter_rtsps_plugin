@@ -4,11 +4,17 @@ PODS:
     - Flutter
   - integration_test (0.0.1):
     - Flutter
+  - SwiftCheck (0.12.0)
 
 DEPENDENCIES:
   - Flutter (from `Flutter`)
   - flutter_rtsps_plugin (from `.symlinks/plugins/flutter_rtsps_plugin/ios`)
   - integration_test (from `.symlinks/plugins/integration_test/ios`)
+  - SwiftCheck (~> 0.12)
+
+SPEC REPOS:
+  trunk:
+    - SwiftCheck
 
 EXTERNAL SOURCES:
   Flutter:
@@ -22,7 +28,8 @@ SPEC CHECKSUMS:
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
   flutter_rtsps_plugin: 6c92f393da09fdf37a25ef6fe3a214373d997f3f
   integration_test: 4a889634ef21a45d28d50d622cf412dc6d9f586e
+  SwiftCheck: d1dd04d955cc76620b0f84e087536bd059a11c24
 
-PODFILE CHECKSUM: e30f02f9d1c72c47bb6344a0a748c9d268180865
+PODFILE CHECKSUM: 3dcce9485f1314c2bbeacd03f427566a171ceaaf
 
 COCOAPODS: 1.16.2
