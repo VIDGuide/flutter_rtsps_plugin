@@ -10,6 +10,12 @@ struct RtpStats {
     var highestSeq: UInt32
     var packetCount: UInt32
     var octetCount: UInt32
+    /// RTP timestamp from the most recent packet (clock rate units).
+    /// Used by RtcpSender to compute interarrival jitter per RFC 3550 §6.4.1.
+    var rtpTimestamp: UInt32 = 0
+    /// Wall-clock arrival time of the most recent packet (seconds, monotonic).
+    /// Used together with `rtpTimestamp` for jitter computation.
+    var arrivalTime: Double = 0
 }
 
 // MARK: - RtpDemuxer
@@ -38,6 +44,14 @@ final class RtpDemuxer {
     /// Used by RtcpSender to populate Receiver Report fields. (Req 3.2)
     var onRtpStats: ((RtpStats) -> Void)?
 
+    /// When `true`, the demuxer reads and discards TCP interleaved RTP data
+    /// without processing it. RTCP packets (channel 1) are still forwarded.
+    /// Used when UDP transport is active — the TCP read loop must continue
+    /// to drain the kernel receive buffer (preventing the server's send
+    /// buffer from filling and stalling the encoder) but the actual video
+    /// data arrives via UDP.
+    var drainOnly = false
+
     // MARK: - Private state
 
     private let transport: RtspTransport
@@ -58,12 +72,36 @@ final class RtpDemuxer {
     /// compute the extended highest sequence number per RFC 3550 (Defect 1.28).
     private var seqCycles: UInt32 = 0
 
+    /// Counter for throttling sequence gap log messages. Only logs every Nth gap
+    /// to avoid flooding the console when UDP delivers many duplicates/reorders.
+    private var gapLogCount: UInt32 = 0
+    /// Number of duplicate packets silently dropped (for diagnostics).
+    private var duplicateCount: UInt32 = 0
+
+    /// Counter for throttling "FU-A without start" log messages.
+    private var fuaNoStartLogCount: UInt32 = 0
+
     /// Maximum size of a reassembled FU-A NAL unit (2 MB). Buffers exceeding
     /// this are discarded to prevent unbounded memory growth on bad streams.
     private static let maxFuaBufferSize = 2 * 1024 * 1024
 
     /// Running RTP statistics forwarded to RtcpSender.
     private var stats = RtpStats(ssrc: 0, highestSeq: 0, packetCount: 0, octetCount: 0)
+
+    // --- Diagnostic logging ---
+
+    /// Wall-clock time of the last diagnostic log emission.
+    private var lastDiagTime: Double = 0
+    /// Packet count at the time of the last diagnostic log.
+    private var lastDiagPacketCount: UInt32 = 0
+    /// Octet count at the time of the last diagnostic log.
+    private var lastDiagOctetCount: UInt32 = 0
+    /// Number of transport reads performed since the last diagnostic log.
+    private var readsSinceDiag: UInt32 = 0
+    /// Number of RTCP packets received since the last diagnostic log.
+    private var rtcpCountSinceDiag: UInt32 = 0
+    /// Interval between diagnostic log emissions (seconds).
+    private static let diagInterval: Double = 5.0
 
     private let log = OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin", category: "RtpDemuxer")
 
@@ -109,19 +147,35 @@ final class RtpDemuxer {
         fuaBuffer = nil
         lastSeq = nil
         seqCycles = 0
+        gapLogCount = 0
+        duplicateCount = 0
+        fuaNoStartLogCount = 0
         seedBuffer = nil
         runLock.unlock()
     }
 
     // MARK: - Read Loop
 
+    /// Size of each transport read request. Large enough to consume an entire
+    /// burst of RTP packets in one syscall, small enough to avoid excessive
+    /// memory allocation. 64 KB matches the typical TCP receive window and
+    /// ensures we drain the kernel buffer quickly on bursty encoders like the
+    /// Bambu H2C.
+    private static let readChunkSize = 65_536
+
     private func readLoop() async {
+        // Accumulation buffer — we read whatever the kernel has available
+        // (minimumLength: 1) and parse interleaved frames from this buffer.
+        // This prevents blocking on exact-length reads when a bursty encoder
+        // (e.g. Bambu H2C) splits the last RTP packet across TCP segments
+        // with a multi-second gap between bursts.
+        var buf = Data()
+
         // Consume any seed data from the handshake lookahead (Defect 1.12).
-        // These bytes are prepended to the stream so the first RTP packets
-        // are not lost.
-        var pendingSeed: Data? = nil
         runLock.lock()
-        pendingSeed = seedBuffer
+        if let seed = seedBuffer, !seed.isEmpty {
+            buf.append(seed)
+        }
         seedBuffer = nil
         runLock.unlock()
 
@@ -132,89 +186,140 @@ final class RtpDemuxer {
             guard isRunning else { break }
 
             do {
-                // Read the 4-byte interleaved frame header: $ | channel | length(2)
-                let header: Data
-                if let seed = pendingSeed, seed.count >= 4 {
-                    header = seed.prefix(4)
-                    let remaining = seed.dropFirst(4)
-                    pendingSeed = remaining.isEmpty ? nil : Data(remaining)
-                } else {
-                    // If seed has < 4 bytes, prepend them to the next transport read
-                    if let seed = pendingSeed, !seed.isEmpty {
-                        var combined = seed
-                        let chunk = try await transport.receive(minimumLength: 1, maximumLength: 4 - seed.count)
-                        combined.append(chunk)
-                        pendingSeed = nil
-                        if combined.count < 4 {
-                            let more = try await transport.receive(minimumLength: 4 - combined.count, maximumLength: 4 - combined.count)
-                            combined.append(more)
+                // Parse as many complete interleaved frames as possible from buf.
+                while let frame = Self.extractFrame(from: &buf) {
+                    switch frame.channel {
+                    case 0:
+                        if drainOnly {
+                            // UDP is active — discard TCP RTP data silently.
+                            // We still need to read it to drain the kernel buffer.
+                            break
                         }
-                        header = combined.prefix(4)
-                        if combined.count > 4 {
-                            pendingSeed = Data(combined.dropFirst(4))
-                        }
-                    } else {
-                        header = try await transport.receive(minimumLength: 4, maximumLength: 4)
+                        processRtpPacket(frame.payload)
+                    case 1:
+                        rtcpCountSinceDiag += 1
+                        onRtcpPacket?(frame.payload)
+                    default:
+                        os_log("RtpDemuxer: unknown channel %u, discarding",
+                               log: log, type: .default, frame.channel)
                     }
-                }
-                guard header.count == 4 else { continue }
 
-                // Validate magic byte (Req 2.1)
-                guard header[0] == 0x24 else {
-                    os_log("RtpDemuxer: unexpected byte 0x%02x, expected 0x24", log: log, type: .error, header[0])
-                    continue
-                }
-
-                let channel = header[1]
-                let length = (UInt16(header[2]) << 8) | UInt16(header[3])
-
-                // Discard zero-length frames
-                if length == 0 {
-                    continue
+                    // Re-check running flag between frames so stop() is responsive
+                    // even when a large burst fills the buffer with many frames.
+                    runLock.lock()
+                    let stillRunning = running
+                    runLock.unlock()
+                    guard stillRunning else { return }
                 }
 
-                // Read the payload
-                let payload: Data
-                if let seed = pendingSeed, !seed.isEmpty {
-                    if seed.count >= Int(length) {
-                        payload = Data(seed.prefix(Int(length)))
-                        let remaining = seed.dropFirst(Int(length))
-                        pendingSeed = remaining.isEmpty ? nil : Data(remaining)
-                    } else {
-                        var combined = seed
-                        pendingSeed = nil
-                        let needed = Int(length) - combined.count
-                        let chunk = try await transport.receive(
-                            minimumLength: needed,
-                            maximumLength: needed
-                        )
-                        combined.append(chunk)
-                        payload = combined
-                    }
-                } else {
-                    payload = try await transport.receive(
-                        minimumLength: Int(length),
-                        maximumLength: Int(length)
-                    )
+                // Read whatever the kernel has available — minimumLength: 1
+                // ensures we never block waiting for a specific byte count.
+                let chunk = try await transport.receive(
+                    minimumLength: 1,
+                    maximumLength: Self.readChunkSize
+                )
+                buf.append(chunk)
+                readsSinceDiag += 1
+
+                // Periodic diagnostic logging
+                let now = ProcessInfo.processInfo.systemUptime
+                if lastDiagTime == 0 { lastDiagTime = now }
+                if now - lastDiagTime >= RtpDemuxer.diagInterval {
+                    let elapsed = now - lastDiagTime
+                    let pktDelta = stats.packetCount - lastDiagPacketCount
+                    let byteDelta = stats.octetCount - lastDiagOctetCount
+                    let pps = elapsed > 0 ? Double(pktDelta) / elapsed : 0
+                    let kbps = elapsed > 0 ? Double(byteDelta) * 8.0 / elapsed / 1000.0 : 0
+                    os_log("RtpDemuxer: [diag] %.1fs: %u pkts (%.0f pps, %.0f kbps) seq=%u reads=%u rtcp=%u buf=%d dups=%u gaps=%u",
+                           log: log, type: .info,
+                           elapsed, pktDelta, pps, kbps,
+                           stats.highestSeq, readsSinceDiag, rtcpCountSinceDiag, buf.count,
+                           duplicateCount, gapLogCount)
+                    lastDiagTime = now
+                    lastDiagPacketCount = stats.packetCount
+                    lastDiagOctetCount = stats.octetCount
+                    readsSinceDiag = 0
+                    rtcpCountSinceDiag = 0
                 }
 
-                switch channel {
-                case 0:
-                    processRtpPacket(payload)
-                case 1:
-                    onRtcpPacket?(payload)
-                default:
-                    os_log("RtpDemuxer: unknown channel %u, discarding", log: log, type: .default, channel)
+                // Compact: if we've consumed most of the buffer but there's a
+                // large prefix of empty space from previous removeFirst calls,
+                // Data's internal storage may hold onto it. Re-creating from a
+                // slice forces a copy that releases the old backing store.
+                // Only do this when the consumed prefix is large to avoid
+                // unnecessary copies on every iteration.
+                if buf.startIndex > 16_384 {
+                    buf = Data(buf)
                 }
 
             } catch {
-                // Transport closed or errored — exit the loop cleanly (Req: graceful close)
-                os_log("RtpDemuxer: read loop exiting: %{public}@", log: log, type: .info, error.localizedDescription)
+                // Transport closed or errored — exit the loop cleanly
+                os_log("RtpDemuxer: read loop exiting: %{public}@",
+                       log: log, type: .info, error.localizedDescription)
                 runLock.lock()
                 running = false
                 runLock.unlock()
             }
         }
+    }
+
+    // MARK: - Frame Extraction
+
+    /// A parsed interleaved frame: channel + payload.
+    private struct InterleavedFrame {
+        let channel: UInt8
+        let payload: Data
+    }
+
+    /// Attempts to extract one complete interleaved frame from the front of
+    /// `buf`. Returns `nil` if the buffer doesn't contain a complete frame yet.
+    ///
+    /// Scans for the 0x24 ('$') magic byte, skipping any non-interleaved bytes
+    /// (e.g. RTSP TEARDOWN response text that arrives during teardown).
+    ///
+    /// On success, the consumed bytes (header + payload) are removed from `buf`.
+    /// On failure (incomplete), `buf` is left unchanged so the caller can read
+    /// more data and retry.
+    private static func extractFrame(from buf: inout Data) -> InterleavedFrame? {
+        // Scan for the 0x24 magic byte, discarding any leading non-interleaved bytes.
+        while !buf.isEmpty {
+            let startIdx = buf.startIndex
+
+            guard buf[startIdx] == 0x24 else {
+                // Skip non-interleaved byte. 0x52 = 'R' from RTSP TEARDOWN
+                // response — expected during teardown, not worth logging.
+                buf.removeFirst()
+                continue
+            }
+
+            // Need at least 4 bytes for the header: $ | channel | length(2)
+            guard buf.count >= 4 else { return nil }
+
+            let channel = buf[startIdx + 1]
+            let length = Int(UInt16(buf[startIdx + 2]) << 8 | UInt16(buf[startIdx + 3]))
+
+            // Zero-length frame — consume header and continue scanning
+            if length == 0 {
+                buf.removeFirst(4)
+                continue
+            }
+
+            // Check if the full payload is available
+            let totalFrameSize = 4 + length
+            guard buf.count >= totalFrameSize else {
+                // Incomplete frame — leave buf intact, caller will read more data
+                return nil
+            }
+
+            // Extract payload and consume the frame from the buffer
+            let payloadStart = startIdx + 4
+            let payload = Data(buf[payloadStart ..< payloadStart + length])
+            buf.removeFirst(totalFrameSize)
+
+            return InterleavedFrame(channel: channel, payload: payload)
+        }
+
+        return nil
     }
 
     // MARK: - RTP Packet Processing
@@ -275,17 +380,67 @@ final class RtpDemuxer {
         stats.highestSeq = (seqCycles << 16) | seqNum
         stats.packetCount += 1
         stats.octetCount += UInt32(payload.count)
+
+        // Bytes 4-7: RTP timestamp
+        let rtpTimestamp = (UInt32(packet[4]) << 24) | (UInt32(packet[5]) << 16)
+                         | (UInt32(packet[6]) << 8)  |  UInt32(packet[7])
+        stats.rtpTimestamp = rtpTimestamp
+        stats.arrivalTime = ProcessInfo.processInfo.systemUptime
+
         onRtpStats?(stats)
 
-        // Detect sequence number discontinuity — if a gap is detected while
-        // reassembling a FU-A unit, discard the stale buffer so we don't
-        // forward a corrupt NAL unit to the decoder.
+        // Detect sequence number discontinuity during FU-A reassembly.
+        //
+        // UDP transport can deliver duplicate packets, minor reordering,
+        // and small gaps from WiFi packet loss. Strategy:
+        //   1. Duplicate (seqNum == lastSeq): silently drop.
+        //   2. Late/reordered (seqNum < expected, small delta): drop packet,
+        //      keep FU-A buffer intact.
+        //   3. Small forward gap (1-3 packets): continue FU-A reassembly.
+        //      VideoToolbox handles minor corruption better than a fully
+        //      dropped frame (which causes cascading P-frame glitches).
+        //   4. Large forward gap (4+ packets): discard FU-A buffer — too
+        //      much data is missing for a usable frame.
         if let last = lastSeq {
             let expected = (last + 1) & 0xFFFF
-            if seqNum != expected && fuaBuffer != nil {
-                os_log("RtpDemuxer: seq gap detected (%u → %u), discarding FU-A buffer",
-                       log: log, type: .default, last, seqNum)
-                fuaBuffer = nil
+            if seqNum == last {
+                // Duplicate packet — skip entirely, don't update lastSeq or stats
+                duplicateCount += 1
+                return
+            }
+            if seqNum != expected {
+                // Check if this is a late/reordered packet (arrived after we
+                // already processed a higher seq). Use modular distance to
+                // handle wraparound: if the forward distance is large (> half
+                // the sequence space), the packet is actually behind us.
+                let forwardDist = (seqNum &- expected) & 0xFFFF
+                if forwardDist > 0x8000 {
+                    // Late packet — behind our current position. Drop it but
+                    // don't destroy the FU-A buffer.
+                    return
+                }
+                // Forward gap — genuine discontinuity.
+                gapLogCount += 1
+                if fuaBuffer != nil {
+                    if forwardDist <= 3 {
+                        // Small gap: continue reassembly. The missing fragment(s)
+                        // will cause minor corruption in this NAL unit but
+                        // VideoToolbox can usually decode it. Much better than
+                        // dropping the entire frame and causing cascading
+                        // reference frame errors on subsequent P-frames.
+                        if gapLogCount <= 5 || gapLogCount % 200 == 0 {
+                            os_log("RtpDemuxer: small seq gap (%u → %u, missing %u), continuing FU-A [gaps=%u]",
+                                   log: log, type: .default, last, seqNum, forwardDist, gapLogCount)
+                        }
+                    } else {
+                        // Large gap: too much data missing, discard buffer.
+                        if gapLogCount <= 5 || gapLogCount % 200 == 0 {
+                            os_log("RtpDemuxer: large seq gap (%u → %u, missing %u), discarding FU-A [gaps=%u]",
+                                   log: log, type: .default, last, seqNum, forwardDist, gapLogCount)
+                        }
+                        fuaBuffer = nil
+                    }
+                }
             }
         }
         lastSeq = seqNum
@@ -350,6 +505,14 @@ final class RtpDemuxer {
             // end-of-access-unit to the decoder's accumulation logic.
             onNalUnit?(nal, isLast && markerBit)
         }
+    }
+
+    // MARK: - UDP Packet Feed
+
+    /// Processes a raw RTP packet received over UDP (no interleaved framing).
+    /// Called by `UdpMediaTransport.onRtpPacket` when using UDP transport.
+    func feedRtpPacket(_ packet: Data) {
+        processRtpPacket(packet)
     }
 
     // MARK: - Testing Shims
@@ -417,7 +580,11 @@ final class RtpDemuxer {
             }
         } else {
             // Middle/end fragment arrived without a start — discard
-            os_log("RtpDemuxer: FU-A fragment received without start, discarding", log: log, type: .default)
+            fuaNoStartLogCount += 1
+            if fuaNoStartLogCount <= 3 || fuaNoStartLogCount % 100 == 0 {
+                os_log("RtpDemuxer: FU-A fragment without start, discarding [count=%u]",
+                       log: log, type: .default, fuaNoStartLogCount)
+            }
         }
     }
 }

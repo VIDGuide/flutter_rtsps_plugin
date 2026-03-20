@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import os.log
 
 // MARK: - RtspStateMachine
 
@@ -47,6 +48,8 @@ final class RtspStateMachine {
     /// be forwarded to the `RtpDemuxer` (Defect 1.12).
     var remainingData: Data?
 
+    private let log = OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin", category: "RtspStateMachine")
+
     // MARK: - Init
 
     /// - Parameters:
@@ -78,26 +81,113 @@ final class RtspStateMachine {
     ///           `RtspError.authenticationFailed` if Digest auth fails,
     ///           `RtspError.noVideoTrack` if the SDP has no video section,
     ///           `RtspError.connectionFailed` for transport-level errors.
-    func runHandshake() async throws -> HandshakeResult {
+    func runHandshake(preferUdp: Bool = true) async throws -> HandshakeResult {
         // OPTIONS
-        _ = try await sendRequest(method: "OPTIONS", uri: url)
+        let optionsResponse = try await sendRequest(method: "OPTIONS", uri: url)
+        os_log("RTSP OPTIONS %d %{public}@", log: log, type: .info,
+               optionsResponse.statusCode, optionsResponse.reason)
+        if let publicHeader = optionsResponse.headers["public"] {
+            os_log("  Public: %{public}@", log: log, type: .info, publicHeader)
+        }
+        logAllHeaders("OPTIONS", optionsResponse)
 
         // DESCRIBE
         let describeResponse = try await sendRequest(method: "DESCRIBE", uri: url, extraHeaders: [
             "Accept": "application/sdp"
         ])
+        os_log("RTSP DESCRIBE %d %{public}@", log: log, type: .info,
+               describeResponse.statusCode, describeResponse.reason)
+        logAllHeaders("DESCRIBE", describeResponse)
         guard let sdpBody = describeResponse.body, !sdpBody.isEmpty else {
             throw RtspError.noVideoTrack
+        }
+        // Log SDP body line by line (truncate very long lines)
+        for sdpLine in sdpBody.components(separatedBy: "\r\n") where !sdpLine.isEmpty {
+            let truncated = sdpLine.count > 200 ? String(sdpLine.prefix(200)) + "..." : sdpLine
+            os_log("  SDP: %{public}@", log: log, type: .info, truncated)
         }
         let videoTrack = try SdpParser.parse(sdpBody)
 
         // Resolve the control URL (may be relative)
         let controlUrl = resolveControlUrl(videoTrack.controlUrl)
 
-        // SETUP
-        let setupResponse = try await sendRequest(method: "SETUP", uri: controlUrl, extraHeaders: [
-            "Transport": "RTP/AVP/TCP;unicast;interleaved=0-1"
-        ])
+        // SETUP — try UDP first (if preferred), fall back to TCP interleaved.
+        // The H2C's TLS+TCP path bottlenecks on the server's ARM CPU,
+        // causing periodic stalls. UDP bypasses TCP flow control entirely.
+        // Note: even over an rtsps:// connection, LIVE555 can accept UDP
+        // transport for the media — only the RTSP signaling uses TLS/TCP.
+        var useUdp = false
+        var serverRtpPort: UInt16 = 0
+        var serverRtcpPort: UInt16 = 0
+        let udpClientRtpPort: UInt16 = 50000 + UInt16.random(in: 0...999) * 2
+        let udpClientRtcpPort = udpClientRtpPort + 1
+
+        let setupResponse: RtspResponse
+
+        if preferUdp {
+            let udpTransportHeader = "RTP/AVP/UDP;unicast;client_port=\(udpClientRtpPort)-\(udpClientRtcpPort)"
+
+            let udpSetupResponse = try await sendRequest(method: "SETUP", uri: controlUrl, extraHeaders: [
+                "Transport": udpTransportHeader
+            ])
+            os_log("RTSP SETUP (UDP attempt) %d %{public}@", log: log, type: .info,
+                   udpSetupResponse.statusCode, udpSetupResponse.reason)
+            if let transportHeader = udpSetupResponse.headers["transport"] {
+                os_log("  Transport: %{public}@", log: log, type: .info, transportHeader)
+            }
+            logAllHeaders("SETUP-UDP", udpSetupResponse)
+
+            if udpSetupResponse.statusCode == 200,
+               let transportHeader = udpSetupResponse.headers["transport"],
+               transportHeader.lowercased().contains("rtp/avp") && !transportHeader.lowercased().contains("tcp") {
+                // Server accepted UDP — parse server_port from Transport header
+                useUdp = true
+                setupResponse = udpSetupResponse
+                let ports = Self.parseServerPorts(from: transportHeader)
+                serverRtpPort = ports.rtp
+                serverRtcpPort = ports.rtcp
+                os_log("RTSP SETUP: server accepted UDP (server_port=%u-%u, client_port=%u-%u)",
+                       log: log, type: .info, serverRtpPort, serverRtcpPort, udpClientRtpPort, udpClientRtcpPort)
+            } else {
+                // Server rejected UDP (461 or returned TCP) — fall back to TCP interleaved
+                os_log("RTSP SETUP: server rejected UDP (%d), falling back to TCP interleaved",
+                       log: log, type: .info, udpSetupResponse.statusCode)
+
+                if udpSetupResponse.statusCode == 200 {
+                    // Server returned 200 but with TCP transport — use it
+                    setupResponse = udpSetupResponse
+                } else {
+                    // Send a new SETUP requesting TCP interleaved
+                    let tcpSetupResponse = try await sendRequest(method: "SETUP", uri: controlUrl, extraHeaders: [
+                        "Transport": "RTP/AVP/TCP;unicast;interleaved=0-1"
+                    ])
+                    os_log("RTSP SETUP (TCP fallback) %d %{public}@", log: log, type: .info,
+                           tcpSetupResponse.statusCode, tcpSetupResponse.reason)
+                    if let transportHeader = tcpSetupResponse.headers["transport"] {
+                        os_log("  Transport: %{public}@", log: log, type: .info, transportHeader)
+                    }
+                    logAllHeaders("SETUP-TCP", tcpSetupResponse)
+                    setupResponse = tcpSetupResponse
+                }
+            }
+        } else {
+            // Direct TCP — no UDP attempt (used by SnapshotCapture)
+            let tcpSetupResponse = try await sendRequest(method: "SETUP", uri: controlUrl, extraHeaders: [
+                "Transport": "RTP/AVP/TCP;unicast;interleaved=0-1"
+            ])
+            os_log("RTSP SETUP %d %{public}@", log: log, type: .info,
+                   tcpSetupResponse.statusCode, tcpSetupResponse.reason)
+            if let transportHeader = tcpSetupResponse.headers["transport"] {
+                os_log("  Transport: %{public}@", log: log, type: .info, transportHeader)
+            }
+            logAllHeaders("SETUP", tcpSetupResponse)
+            setupResponse = tcpSetupResponse
+        }
+
+        if let sessionHeader = setupResponse.headers["session"] {
+            os_log("  Session: %{public}@", log: log, type: .info, sessionHeader)
+        }
+
         // Extract session ID and timeout from SETUP response (Defect 1.13)
         if let sessionHeader = setupResponse.headers["session"] {
             let parts = sessionHeader.components(separatedBy: ";")
@@ -117,7 +207,13 @@ final class RtspStateMachine {
         if let sid = sessionId {
             playHeaders["Session"] = sid
         }
-        _ = try await sendRequest(method: "PLAY", uri: url, extraHeaders: playHeaders)
+        let playResponse = try await sendRequest(method: "PLAY", uri: url, extraHeaders: playHeaders)
+        os_log("RTSP PLAY %d %{public}@", log: log, type: .info,
+               playResponse.statusCode, playResponse.reason)
+        if let rtpInfo = playResponse.headers["rtp-info"] {
+            os_log("  RTP-Info: %{public}@", log: log, type: .info, rtpInfo)
+        }
+        logAllHeaders("PLAY", playResponse)
 
         // Capture any unconsumed lookahead bytes from the last readResponse()
         // so they can be forwarded to the RtpDemuxer (Defect 1.12).
@@ -127,7 +223,14 @@ final class RtspStateMachine {
         return HandshakeResult(
             videoTrack: videoTrack,
             remainingData: leftover,
-            serverTimeout: serverTimeout
+            serverTimeout: serverTimeout,
+            udpTransport: useUdp ? UdpTransportInfo(
+                serverHost: host,
+                serverRtpPort: serverRtpPort,
+                serverRtcpPort: serverRtcpPort,
+                clientRtpPort: udpClientRtpPort,
+                clientRtcpPort: udpClientRtcpPort
+            ) : nil
         )
     }
 
@@ -216,7 +319,7 @@ final class RtspStateMachine {
 
     /// Builds a raw RTSP request `Data` value.
     private func buildRequest(method: String, uri: String, headers: [String: String]) -> Data {
-        var lines = "\(method) \(uri) RTSP/1.0\r\nCSeq: \(cseq)\r\n"
+        var lines = "\(method) \(uri) RTSP/1.0\r\nCSeq: \(cseq)\r\nUser-Agent: Bambu-Client/1.0\r\n"
         cseq += 1
         for (key, value) in headers {
             lines += "\(key): \(value)\r\n"
@@ -253,45 +356,57 @@ final class RtspStateMachine {
             let byte = lookahead.removeFirst()
 
             // Interleaved RTP/RTCP frame: drain it entirely and restart.
-            // This can arrive at ANY point — not just at the start of a response —
-            // on H2-series Bambu printers that pipeline RTP before the RTSP reply.
-            // We detect it when headerData ends on a line boundary (empty or after
-            // a complete \r\n) so we don't misidentify a `$` inside a header value.
-            let onLineBoundary = headerData.isEmpty ||
-                headerData.hasSuffix(Data([0x0D, 0x0A]))
-            if byte == 0x24 && onLineBoundary {
-                // Need channel (1 byte) + length (2 bytes).
-                while lookahead.count < 3 {
-                    let more = try await transport.receive(minimumLength: 1, maximumLength: 3 - lookahead.count)
+            // H2-series Bambu printers pipeline RTP data at ANY point during
+            // the RTSP handshake — including mid-header-line. We detect an
+            // interleaved frame by checking for 0x24 ($) followed by a valid
+            // channel byte (0 or 1). The '$' character CAN appear in RTSP
+            // header values, but never followed by 0x00 or 0x01 in valid
+            // ASCII/UTF-8 text, so this is a safe heuristic.
+            if byte == 0x24 {
+                // Peek at the channel byte
+                while lookahead.isEmpty {
+                    let more = try await transport.receive(minimumLength: 1, maximumLength: 256)
                     lookahead.append(more)
                 }
-                // Read length before mutating lookahead.
-                let lenHi = lookahead[1]
-                let lenLo = lookahead[2]
-                lookahead.removeFirst(3)
-                let payloadLength = Int(lenHi) << 8 | Int(lenLo)
+                let channelByte = lookahead[lookahead.startIndex]
 
-                if payloadLength > 0 {
-                    if lookahead.count >= payloadLength {
-                        lookahead.removeFirst(payloadLength)
-                    } else {
-                        var remaining = payloadLength - lookahead.count
-                        lookahead.removeAll()
-                        while remaining > 0 {
-                            let drain = try await transport.receive(
-                                minimumLength: 1,
-                                maximumLength: min(remaining, 4096)
-                            )
-                            remaining -= drain.count
+                if channelByte <= 1 {
+                    // Valid interleaved frame — drain channel + length + payload
+                    lookahead.removeFirst() // consume channel byte
+                    while lookahead.count < 2 {
+                        let more = try await transport.receive(minimumLength: 1, maximumLength: 2 - lookahead.count)
+                        lookahead.append(more)
+                    }
+                    let base = lookahead.startIndex
+                    let payloadLength = Int(lookahead[base]) << 8 | Int(lookahead[base + 1])
+                    lookahead.removeFirst(2)
+
+                    if payloadLength > 0 {
+                        if lookahead.count >= payloadLength {
+                            lookahead.removeFirst(payloadLength)
+                        } else {
+                            var remaining = payloadLength - lookahead.count
+                            lookahead.removeAll()
+                            while remaining > 0 {
+                                let drain = try await transport.receive(
+                                    minimumLength: 1,
+                                    maximumLength: min(remaining, 4096)
+                                )
+                                remaining -= drain.count
+                            }
                         }
                     }
+                    continue
                 }
-                continue
+                // Not a valid channel — fall through and treat '$' as a header byte
             }
 
             headerData.append(byte)
-            if headerData.count > 65_536 {
-                throw RtspError.connectionFailed("RTSP response headers exceeded 64 KB")
+            // H2-series Bambu printers can send RTSP responses well over 64 KB
+            // (e.g. large SDP bodies in DESCRIBE). 256 KB accommodates these
+            // while still guarding against runaway reads.
+            if headerData.count > 262_144 {
+                throw RtspError.connectionFailed("RTSP response headers exceeded 256 KB")
             }
         }
 
@@ -408,6 +523,39 @@ final class RtspStateMachine {
         return base + controlUrl
     }
 
+    // MARK: - Handshake Logging
+
+    /// Logs all response headers for a given RTSP method at debug level.
+    /// The key headers (Public, Transport, Session, RTP-Info) are already
+    /// logged at info level individually — this captures everything else
+    /// (e.g. Server, Date, Cache-Control, x-* vendor headers) that might
+    /// reveal firmware-specific behavior.
+    private func logAllHeaders(_ method: String, _ response: RtspResponse) {
+        // Skip the headers we already log individually at info level
+        let alreadyLogged: Set<String> = ["public", "transport", "session", "rtp-info", "content-length", "content-type"]
+        for (key, value) in response.headers where !alreadyLogged.contains(key) {
+            os_log("  %{public}@ %{public}@: %{public}@", log: log, type: .debug, method, key, value)
+        }
+    }
+
+    // MARK: - Transport Parsing
+
+    /// Parses `server_port=XXXX-YYYY` from a SETUP Transport response header.
+    static func parseServerPorts(from transport: String) -> (rtp: UInt16, rtcp: UInt16) {
+        // Look for server_port=XXXX-YYYY
+        let pattern = "server_port=(\\d+)-(\\d+)"
+        if let regex = try? NSRegularExpression(pattern: pattern),
+           let match = regex.firstMatch(in: transport, range: NSRange(transport.startIndex..., in: transport)),
+           match.numberOfRanges >= 3,
+           let rtpRange = Range(match.range(at: 1), in: transport),
+           let rtcpRange = Range(match.range(at: 2), in: transport),
+           let rtp = UInt16(transport[rtpRange]),
+           let rtcp = UInt16(transport[rtcpRange]) {
+            return (rtp, rtcp)
+        }
+        return (6970, 6971) // LIVE555 defaults
+    }
+
     // MARK: - Digest Authentication
 
     private struct DigestChallenge {
@@ -500,6 +648,18 @@ final class RtspStateMachine {
     }
 }
 
+// MARK: - UdpTransportInfo
+
+/// UDP transport parameters negotiated during SETUP, used by the session
+/// to create UDP sockets for RTP/RTCP instead of TCP interleaved framing.
+struct UdpTransportInfo {
+    let serverHost: String
+    let serverRtpPort: UInt16
+    let serverRtcpPort: UInt16
+    let clientRtpPort: UInt16
+    let clientRtcpPort: UInt16
+}
+
 // MARK: - HandshakeResult
 
 /// Result of a successful RTSP handshake, containing the video track info,
@@ -514,6 +674,8 @@ struct HandshakeResult {
     /// Server session timeout in seconds parsed from the Session header's
     /// `timeout=N` parameter, or `nil` if not provided (Defect 1.13).
     let serverTimeout: Int?
+    /// UDP transport info if the server accepted UDP, or `nil` for TCP interleaved.
+    let udpTransport: UdpTransportInfo?
 }
 
 // MARK: - RtspResponse

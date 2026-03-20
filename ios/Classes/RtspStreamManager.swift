@@ -1,4 +1,4 @@
-import Flutter
+@preconcurrency import Flutter
 import Foundation
 import os.log
 
@@ -7,7 +7,7 @@ import os.log
 /// Thread safety: all mutations to `sessions` and `nextStreamId` are
 /// serialised on `queue`. All `FlutterResult` callbacks are dispatched
 /// back to the main thread.
-class RtspStreamManager {
+class RtspStreamManager: @unchecked Sendable {
 
     // MARK: - Constants
 

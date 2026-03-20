@@ -31,6 +31,7 @@ final class RtspStreamSession: NSObject {
     private var rtcpSender: RtcpSender?
     private var decoder: H264Decoder?
     private var textureOutput: FlutterTextureOutput?
+    private var udpMediaTransport: UdpMediaTransport?
 
     // MARK: - Private — event channel
 
@@ -163,22 +164,62 @@ final class RtspStreamSession: NSObject {
         demux.onNalUnit = { [weak dec] nalUnit, isFrameComplete in
             dec?.feedNalUnit(nalUnit, isFrameComplete: isFrameComplete)
         }
-        demux.onRtcpPacket = { _ in
-            // RTCP packets from server — no action needed for RR sending
+        demux.onRtcpPacket = { [weak rtcp] data in
+            rtcp?.processRtcpPacket(data)
         }
         demux.onRtpStats = { [weak rtcp] stats in
             rtcp?.updateStats(stats)
         }
         self.demuxer = demux
 
-        // Seed any leftover bytes from the handshake so the first RTP
-        // packets are not lost (Defect 1.12, Req 2.12).
-        if let leftover = handshakeResult.remainingData {
-            demux.seedData(leftover)
+        // Check if UDP transport was negotiated
+        if let udpInfo = handshakeResult.udpTransport {
+            // UDP path: receive RTP/RTCP over UDP sockets instead of TCP interleaved.
+            // This bypasses TCP/TLS backpressure that causes stream stalling on
+            // some Bambu printer firmware (notably H2C).
+            let udpTransport = UdpMediaTransport(info: udpInfo)
+            udpTransport.onRtpPacket = { [weak demux] packet in
+                demux?.feedRtpPacket(packet)
+            }
+            udpTransport.onRtcpPacket = { [weak rtcp] data in
+                rtcp?.processRtcpPacket(data)
+            }
+            udpTransport.onError = { [weak self] error in
+                self?.handleError(error)
+            }
+            // Wire RTCP sender to use UDP instead of TCP interleaved
+            rtcp.udpSendHandler = { [weak udpTransport] data in
+                udpTransport?.sendRtcp(data)
+            }
+            try udpTransport.start()
+            self.udpMediaTransport = udpTransport
+            os_log("RtspStreamSession[%d]: using UDP transport (server %{public}@:%u/%u)",
+                   log: log, type: .info, streamId,
+                   udpInfo.serverHost, udpInfo.serverRtpPort, udpInfo.serverRtcpPort)
+
+            // Start a TCP drain loop to prevent the RTSP signaling connection's
+            // receive buffer from filling up. LIVE555 may send RTCP Sender Reports
+            // (or even interleaved RTP) on the TCP channel regardless of the
+            // negotiated UDP transport. If nobody reads from the TCP socket, the
+            // kernel's receive window closes, the server's send buffer fills, and
+            // the server blocks — stalling the encoder for ALL transports including
+            // UDP. The demuxer's read loop handles this: it reads and discards
+            // TCP interleaved RTP data (drainOnly mode) while still forwarding
+            // RTCP to the sender. Video data comes exclusively from UDP.
+            demux.drainOnly = true
+            if let leftover = handshakeResult.remainingData {
+                demux.seedData(leftover)
+            }
+            demux.start()
+        } else {
+            // TCP interleaved path: seed leftover bytes and start demuxer read loop
+            if let leftover = handshakeResult.remainingData {
+                demux.seedData(leftover)
+            }
+            demux.start()
         }
 
-        // Start streaming components
-        demux.start()
+        // Start RTCP sender (works for both UDP and TCP paths)
         rtcp.start()
 
         os_log("RtspStreamSession[%d]: streaming started, textureId=%lld",
@@ -244,6 +285,9 @@ final class RtspStreamSession: NSObject {
         // 3. Stop demuxer read loop
         demuxer?.stop()
 
+        // 3b. Stop UDP media transport if active
+        udpMediaTransport?.stop()
+
         // 4. Stop decoder (invalidates VTDecompressionSession)
         decoder?.stop()
 
@@ -257,6 +301,7 @@ final class RtspStreamSession: NSObject {
         rtcpSender = nil
         decoder = nil
         textureOutput = nil
+        udpMediaTransport = nil
 
         // 7. Clean up event channel (Defect 1.21)
         await MainActor.run {

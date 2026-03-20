@@ -42,6 +42,13 @@ final class H264Decoder {
     private var inBandSps: Data?
     private var inBandPps: Data?
 
+    /// Currently active SPS/PPS used by the decoder session. Compared against
+    /// incoming in-band parameter sets to avoid unnecessary teardown/reinit
+    /// cycles when the H.264 encoder resends identical SPS/PPS at keyframe
+    /// boundaries (common on Bambu H2C — every ~10s).
+    private var activeSps: Data?
+    private var activePps: Data?
+
     private let queue = DispatchQueue(label: "com.pandawatch.flutter_rtsps_plugin.h264decoder",
                                      qos: .userInteractive)
     private let log = OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin", category: "H264Decoder")
@@ -71,6 +78,8 @@ final class H264Decoder {
         // Called from RtspStreamSession.start() before the demuxer is running,
         // so no concurrent feedNalUnit calls exist yet — run inline, no dispatch needed.
         try initializeDecoderSync(sps: sps, pps: pps)
+        activeSps = sps
+        activePps = pps
     }
 
     /// Internal implementation — must be called on `queue`.
@@ -297,6 +306,21 @@ final class H264Decoder {
         }
     }
 
+    /// Synchronous variant of `stop()` that blocks until the VTDecompressionSession
+    /// is fully invalidated and all in-flight callbacks have completed.
+    ///
+    /// Use this in `SnapshotCapture`'s `defer` block (or any context where the
+    /// `H264Decoder` will be released immediately after stop). The async `stop()`
+    /// dispatches teardown to the decoder queue and returns immediately — if the
+    /// caller then releases the decoder, the `Unmanaged` refcon in the VT callback
+    /// becomes a dangling pointer, causing `EXC_BAD_ACCESS`.
+    func stopSync() {
+        pendingNalUnits = []
+        queue.sync { [self] in
+            self.tearDownSession()
+        }
+    }
+
     // MARK: - Private Helpers
 
     private func tearDownSession() {
@@ -313,25 +337,42 @@ final class H264Decoder {
         formatDescription = nil
         isInitialized = false
         pendingNalUnits = []
+        activeSps = nil
+        activePps = nil
     }
 
     /// Initializes (or re-initializes) the decoder once both in-band SPS and
     /// PPS have been received.
     ///
-    /// Re-initialization is intentionally allowed: mid-stream SPS/PPS changes
-    /// (e.g. resolution or bitrate switch at a keyframe boundary) must cause a
-    /// decoder reset. Continuing with stale parameter sets produces corrupted
-    /// frames. Pending NAL units from the previous parameter set are flushed
-    /// before teardown since they cannot be decoded with the new format
-    /// description. (Req 4.7)
+    /// Compares incoming SPS/PPS against the currently active parameter sets.
+    /// If they are identical, the decoder session is kept as-is — avoiding the
+    /// expensive teardown/reinit cycle that drops pending frames and causes
+    /// visible stuttering. The Bambu H2C resends identical SPS/PPS at every
+    /// keyframe boundary (~10s), so this check is critical for smooth playback.
+    ///
+    /// Re-initialization only occurs when the parameter sets actually change
+    /// (e.g. resolution or bitrate switch). Pending NAL units from the previous
+    /// parameter set are flushed before teardown since they cannot be decoded
+    /// with the new format description. (Req 4.7)
     private func tryInitializeFromInBand() {
         guard let sps = inBandSps, let pps = inBandPps else { return }
+
+        // Skip re-init if the parameter sets haven't changed.
+        if isInitialized, let aSps = activeSps, let aPps = activePps,
+           aSps == sps, aPps == pps {
+            // Clear the buffers — we've confirmed they match.
+            inBandSps = nil
+            inBandPps = nil
+            return
+        }
 
         // Discard any picture NALs that were queued under the old parameter sets.
         pendingNalUnits = []
 
         do {
             try initializeDecoderSync(sps: sps, pps: pps)
+            activeSps = sps
+            activePps = pps
             inBandSps = nil
             inBandPps = nil
         } catch {
@@ -374,10 +415,14 @@ private func decompressionOutputCallback(
     let decoder = Unmanaged<H264Decoder>.fromOpaque(refCon).takeUnretainedValue()
 
     guard status == noErr else {
-        // Per-frame decode error: discard frame, continue (Req 4.5)
-        os_log("H264Decoder: decode callback error: %d",
-               log: OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin", category: "H264Decoder"),
-               type: .error, status)
+        // -12909 (kVTVideoDecoderBadDataErr) is expected when joining a stream
+        // mid-GOP without an IDR keyframe (e.g. snapshot capture). Suppress to
+        // avoid log spam — the decoder will recover on the next keyframe.
+        if status != -12909 {
+            os_log("H264Decoder: decode callback error: %d",
+                   log: OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin", category: "H264Decoder"),
+                   type: .error, status)
+        }
         return
     }
 

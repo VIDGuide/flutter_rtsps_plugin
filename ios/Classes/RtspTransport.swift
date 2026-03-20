@@ -180,6 +180,13 @@ final class RtspTransport {
     // MARK: - Private helpers
 
     /// Builds `NWParameters` with TLS configured to accept self-signed certificates.
+    ///
+    /// TCP options are tuned for low-latency RTSP streaming:
+    /// - `noDelay = true` disables Nagle's algorithm so our small RTCP
+    ///   Receiver Report packets (36 bytes) are sent immediately rather than
+    ///   being held for coalescing. Some Bambu printer firmware (notably the
+    ///   H2C) appears to use TCP-level feedback to pace its encoder — delayed
+    ///   ACKs from Nagle buffering can cause the encoder to stall.
     private static func makeTLSParameters() -> NWParameters {
         let tlsOptions = NWProtocolTLS.Options()
 
@@ -195,7 +202,14 @@ final class RtspTransport {
             verifyQueue
         )
 
-        let parameters = NWParameters(tls: tlsOptions)
+        // Configure TCP for low-latency streaming
+        let tcpOptions = NWProtocolTCP.Options()
+        tcpOptions.noDelay = true                    // Disable Nagle's algorithm
+        tcpOptions.connectionTimeout = 10            // 10-second connection timeout
+        tcpOptions.enableKeepalive = true            // Keep connection alive during stalls
+        tcpOptions.keepaliveIdle = 5                 // Start keepalive probes after 5s idle
+
+        let parameters = NWParameters(tls: tlsOptions, tcp: tcpOptions)
         return parameters
     }
 }
