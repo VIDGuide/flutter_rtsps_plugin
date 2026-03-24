@@ -86,8 +86,21 @@ final class FlutterTextureOutput: NSObject, FlutterTexture {
     /// `textureFrameAvailable` call is enqueued. This prevents a bursty stream
     /// (catching up after a jitter/stall) from flooding the main-thread dispatch
     /// queue and delaying texture notifications for other concurrent streams.
+    ///
+    /// The incoming CVPixelBuffer is explicitly retained via CVPixelBufferRetain
+    /// so that VideoToolbox cannot recycle the backing IOSurface while Flutter's
+    /// Metal renderer is still accessing the texture. Without this, a race
+    /// between the decoder's buffer pool reclaim and the GPU's texture read
+    /// causes EXC_BAD_ACCESS in TextureMipmapLevelCount (PANDA-WATCH-24).
     func onNewFrame(_ pixelBuffer: CVPixelBuffer) {
+        // Retain the buffer so the decoder pool cannot reclaim it while we hold it.
+        CVPixelBufferRetain(pixelBuffer)
+
         let shouldNotify = withLock {
+            // Release the previous buffer now that we have a replacement.
+            if let prev = latestPixelBuffer {
+                CVPixelBufferRelease(prev)
+            }
             latestPixelBuffer = pixelBuffer
             if pendingTextureNotification {
                 // A notification is already queued — it will pick up this newer buffer.
@@ -139,9 +152,14 @@ final class FlutterTextureOutput: NSObject, FlutterTexture {
     func stop() {
         // 1. Under lock: capture registry ref and textureId, then nil out state
         //    so any concurrent copyPixelBuffer returns nil immediately.
+        //    Release the retained pixel buffer to balance the CVPixelBufferRetain
+        //    in onNewFrame (PANDA-WATCH-24).
         let (registry, id) = withLock { () -> (FlutterTextureRegistry?, Int64) in
             let reg = textureRegistry
             let tid = textureId
+            if let buf = latestPixelBuffer {
+                CVPixelBufferRelease(buf)
+            }
             latestPixelBuffer = nil
             pendingTextureNotification = false
             textureRegistry = nil
