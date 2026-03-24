@@ -238,16 +238,16 @@ final class JitterBufferPropertyTests: XCTestCase {
     // **Validates: Requirements 1.8**
 
     /// After overflow handling: non-IDR dropped before IDR; if still over limit (all-IDR),
-    /// oldest IDR dropped; fill level always ≤ 2× depth.
+    /// oldest IDR dropped; fill level always ≤ 5× depth.
     func testOverflowDropsPreserveIDRFrames() {
-        // bufferDepthMs=50 → maxAllowed = max(1, (2*50)/33) = 3
-        let maxAllowed = 3
+        // bufferDepthMs=50 → maxAllowed = max(3, (5*50)/33) = 7
+        let maxAllowed = 7
 
         // Generate a mix of IDR and non-IDR frames exceeding the threshold
-        let totalCountGen = Gen<Int>.fromElements(in: (maxAllowed + 1)...15)
-        let idrCountGen = Gen<Int>.fromElements(in: 0...15)
+        let totalCountGen = Gen<Int>.fromElements(in: (maxAllowed + 1)...25)
+        let idrCountGen = Gen<Int>.fromElements(in: 0...25)
 
-        property("Overflow drops non-IDR before IDR, fill level always ≤ 2× depth", arguments: args) <- forAll(totalCountGen, idrCountGen) { (totalCount: Int, rawIdrCount: Int) in
+        property("Overflow drops non-IDR before IDR, fill level always ≤ 5× depth", arguments: args) <- forAll(totalCountGen, idrCountGen) { (totalCount: Int, rawIdrCount: Int) in
             let idrCount = min(rawIdrCount, totalCount)
             let config = JitterBufferConfig(bufferDepthMs: 50, transportMode: .tcp)
             let jb = JitterBuffer(config: config)
@@ -297,9 +297,9 @@ final class JitterBufferPropertyTests: XCTestCase {
 
     /// When all frames are IDR, oldest IDR frames are dropped to maintain the limit.
     func testOverflowAllIDRDropsOldest() {
-        let maxAllowed = 3 // bufferDepthMs=50
+        let maxAllowed = 7 // bufferDepthMs=50, max(3, (5*50)/33) = 7
 
-        let totalCountGen = Gen<Int>.fromElements(in: (maxAllowed + 1)...15)
+        let totalCountGen = Gen<Int>.fromElements(in: (maxAllowed + 1)...25)
 
         property("All-IDR overflow drops oldest IDR frames, preserves newest", arguments: args) <- forAll(totalCountGen) { (totalCount: Int) in
             let config = JitterBufferConfig(bufferDepthMs: 50, transportMode: .tcp)
@@ -403,13 +403,14 @@ final class JitterBufferPropertyTests: XCTestCase {
     /// After underrun, no frames released until bufferDepthMs elapsed since first enqueue.
     /// No null/empty access units ever emitted.
     /// Tests state transitions: fresh buffer starts buffering, enqueue keeps buffering state,
-    /// releasing all frames returns to buffering state, and no null/empty frames are emitted.
+    /// releasing all frames does NOT return to buffering state (only initial buffering gates release),
+    /// and no null/empty frames are emitted.
     func testUnderrunBufferingPeriod() {
         let countGen = Gen<Int>.fromElements(in: 1...20)
         let depthGen = Gen<Int>.fromElements(in: 50...1000)
         let baseTimestampGen = Gen<UInt32>.choose((0, UInt32.max - 1_000_000))
 
-        property("Fresh buffer starts buffering; after drain, returns to buffering; no null/empty AUs", arguments: args) <- forAll(countGen, depthGen, baseTimestampGen) { (count: Int, depth: Int, baseTs: UInt32) in
+        property("Fresh buffer starts buffering; after initial release, stays non-buffering; no null/empty AUs", arguments: args) <- forAll(countGen, depthGen, baseTimestampGen) { (count: Int, depth: Int, baseTs: UInt32) in
             for mode in [TransportMode.tcp, TransportMode.udp] {
                 let config = JitterBufferConfig(bufferDepthMs: depth, transportMode: mode)
                 let jb = JitterBuffer(config: config)
@@ -448,16 +449,17 @@ final class JitterBufferPropertyTests: XCTestCase {
                 guard releasedCount > 0 else { return false }
                 guard releasedCount <= count else { return false }
 
-                // 4. After releasing all frames (buffer empty), isInBufferingState returns to true
-                guard jb.isInBufferingState else { return false }
+                // 4. After releasing all frames, isInBufferingState is false —
+                //    the buffer does NOT re-enter full buffering mode on empty.
+                guard !jb.isInBufferingState else { return false }
 
-                // 5. Enqueue again after underrun — should be back in buffering state
+                // 5. Enqueue again after drain — NOT in buffering state (no re-buffering)
                 let recoveryAU = Self.makeAccessUnit(
                     rtpTimestamp: baseTs &+ UInt32(count) * 3000,
                     sequenceNumber: UInt16(truncatingIfNeeded: count)
                 )
                 jb.enqueue(recoveryAU)
-                guard jb.isInBufferingState else { return false }
+                guard !jb.isInBufferingState else { return false }
 
                 // Release the recovery frame — verify non-null, non-empty
                 if let recovered = jb.releaseNextForTesting() {
@@ -469,8 +471,8 @@ final class JitterBufferPropertyTests: XCTestCase {
                     return false
                 }
 
-                // After draining again, back to buffering
-                guard jb.isInBufferingState else { return false }
+                // After draining again, still not in buffering state
+                guard !jb.isInBufferingState else { return false }
             }
             return true
         }
@@ -906,12 +908,12 @@ extension JitterBufferPropertyTests {
         }
     }
 
-    /// Recovery callback: after a stall, enqueuing a new frame and releasing it
-    /// fires exactly one .recovery event.
+    /// Recovery callback: after a stall, enqueuing new frames fires a .recovery
+    /// event (recovery is detected on enqueue, not on release).
     func testStreamHealthRecoveryCallback() {
         let frameCountGen = Gen<Int>.fromElements(in: 2...10)
 
-        property("onStreamHealth fires .recovery when releasing first frame after stall", arguments: args) <- forAll(frameCountGen) { (frameCount: Int) in
+        property("onStreamHealth fires .recovery when enqueuing frames after stall", arguments: args) <- forAll(frameCountGen) { (frameCount: Int) in
             let config = JitterBufferConfig(bufferDepthMs: 1000, transportMode: .tcp)
             let jb = JitterBuffer(config: config)
 
@@ -940,7 +942,10 @@ extension JitterBufferPropertyTests {
             // Clear events for recovery phase
             events.removeAll()
 
-            // Phase 2: Enqueue multiple frames after stall, then release first one → recovery
+            // Phase 2: Wait a bit to ensure stall duration > 50ms threshold,
+            // then enqueue frames — recovery fires on enqueue
+            Thread.sleep(forTimeInterval: 0.06)
+
             for i in 0..<3 {
                 let au = Self.makeAccessUnit(
                     rtpTimestamp: UInt32(frameCount + i) * 3000,
@@ -948,9 +953,6 @@ extension JitterBufferPropertyTests {
                 )
                 jb.enqueue(au)
             }
-
-            // Release the first frame — should trigger recovery
-            _ = jb.releaseNextForTesting()
 
             let recoveryEvents = events.filter {
                 if case .recovery = $0 { return true }

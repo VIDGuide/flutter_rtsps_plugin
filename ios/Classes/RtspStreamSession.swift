@@ -130,8 +130,9 @@ final class RtspStreamSession: NSObject {
         // Check for cancellation after connect (Defect 1.7)
         try Task.checkCancellation()
 
-        // Run RTSP handshake
-        let handshakeResult = try await sm.runHandshake()
+        // Run RTSP handshake — force TCP interleaved transport for live streams.
+        // UDP has massive packet loss on WiFi (90+ FU-A seq gaps on H2C).
+        let handshakeResult = try await sm.runHandshake(preferUdp: false)
         let videoTrack = handshakeResult.videoTrack
         os_log("RtspStreamSession[%d]: handshake complete", log: log, type: .info, streamId)
 
@@ -421,8 +422,8 @@ final class RtspStreamSession: NSObject {
         let port = UInt16(parsed.port ?? defaultPort)
         try await newTransport.connect(host: host, port: port)
 
-        // Run handshake on new connection
-        let handshakeResult = try await newSm.runHandshake()
+        // Run handshake on new connection — force TCP (same as start())
+        let handshakeResult = try await newSm.runHandshake(preferUdp: false)
         let videoTrack = handshakeResult.videoTrack
 
         // Initialize decoder with new SPS/PPS if available

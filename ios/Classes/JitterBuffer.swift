@@ -57,10 +57,12 @@ final class JitterBuffer {
     /// Gain 1/16 per RFC 3550 convention (Req 2.5).
     private var emaInterval: Double?
 
-    /// True while in the initial buffering period or recovering from underrun (Req 1.9).
+    /// True only during the initial buffering period at stream start or after reset (Req 1.9).
+    /// Once the initial buffer fills, this stays false — momentary buffer empties
+    /// do NOT re-enter full buffering mode (that was causing cascading stalls).
     private var isBuffering: Bool = true
 
-    /// Wall-clock time when the first frame was enqueued after an underrun.
+    /// Wall-clock time when the first frame was enqueued after stream start/reset.
     private var bufferingStartTime: TimeInterval?
 
     /// Cumulative frames released via `onReleaseFrame`.
@@ -89,6 +91,24 @@ final class JitterBuffer {
     /// Wall-clock time when the most recent stall (underrun) began.
     /// Set when the buffer empties during release; cleared on recovery.
     private var stallStartTime: TimeInterval?
+
+    /// Wall-clock time when the last frame was actually released via the timer.
+    /// Used by the playout clock watchdog to detect drift stalls — if frames
+    /// are buffered but none released for >2s, the playout clock is resynced.
+    private var lastReleaseTime: TimeInterval?
+
+    /// Watchdog threshold: if frames are buffered but none released for this
+    /// duration, resync the playout clock to recover from drift. (2 seconds)
+    private static let playoutWatchdogThreshold: TimeInterval = 2.0
+
+    /// Count of consecutive frames discarded as stale. When this exceeds
+    /// `staleResetThreshold`, the playout reference is reset to accept the
+    /// new RTP timestamp epoch (e.g. after a server-side discontinuity).
+    private var consecutiveStaleDiscards: Int = 0
+
+    /// After this many consecutive stale discards (~1s at 30fps), reset the
+    /// playout reference to resync with the new timestamp epoch.
+    private static let staleResetThreshold: Int = 30
 
     // MARK: - Adaptive Buffer Depth State (protected by _lock, Req 13.1–13.4)
 
@@ -167,20 +187,42 @@ final class JitterBuffer {
     ///   signed 16-bit comparison. (Req 1.3, 9.2)
     func enqueue(_ accessUnit: AccessUnit) {
         var burstEvent: StreamHealthEvent?
+        var recoveryEvent: StreamHealthEvent?
 
         withLock {
             _stats.totalFramesReceived += 1
 
             // Stale frame discard: if the frame's RTP timestamp is more than
             // 270,000 ticks (3s) behind the current playout position, drop it. (Req 2.4)
+            // If we get staleResetThreshold consecutive stale discards, the server
+            // has likely jumped to a new RTP timestamp epoch — reset the reference
+            // so we can accept frames again.
             if let current = lastReleasedTimestamp {
                 let age = Int32(bitPattern: current &- accessUnit.rtpTimestamp)
                 if age > Int32(Self.staleThresholdTicks) {
-                    _stats.totalFramesDropped += 1
-                    os_log("JitterBuffer: discarding stale frame (age=%d ticks, threshold=%d)",
-                           log: Self.log, type: .info,
-                           age, Self.staleThresholdTicks)
-                    return
+                    consecutiveStaleDiscards += 1
+                    if consecutiveStaleDiscards >= Self.staleResetThreshold {
+                        // RTP timestamp epoch has shifted — reset playout reference.
+                        os_log("JitterBuffer: %d consecutive stale discards, resetting playout reference (old base=%u, new frame=%u)",
+                               log: Self.log, type: .info,
+                               consecutiveStaleDiscards, current, accessUnit.rtpTimestamp)
+                        baseRtpTimestamp = nil
+                        baseWallClock = nil
+                        lastReleasedTimestamp = nil
+                        lastReleaseTime = nil
+                        emaInterval = nil
+                        consecutiveStaleDiscards = 0
+                        // Fall through to enqueue this frame normally.
+                    } else {
+                        _stats.totalFramesDropped += 1
+                        os_log("JitterBuffer: discarding stale frame (age=%d ticks, threshold=%d)",
+                               log: Self.log, type: .info,
+                               age, Self.staleThresholdTicks)
+                        return
+                    }
+                } else {
+                    // Non-stale frame accepted — reset consecutive counter.
+                    consecutiveStaleDiscards = 0
                 }
             }
 
@@ -207,13 +249,29 @@ final class JitterBuffer {
             // Adaptive depth: measure jitter and adjust depth. (Req 13.1, 13.2)
             updateAdaptiveDepth(arrivalTime: accessUnit.arrivalTime)
 
-            // If we're in the buffering period, record when the first frame arrived.
+            // If we're in the initial buffering period, record when the first frame arrived.
             if isBuffering && bufferingStartTime == nil {
                 bufferingStartTime = ProcessInfo.processInfo.systemUptime
             }
+
+            // Clear stall state when frames resume after a stall (recovery is
+            // emitted by the release timer when it next releases a frame).
+            if stallStartTime != nil {
+                let now = ProcessInfo.processInfo.systemUptime
+                let stallDurationMs = (now - stallStartTime!) * 1000.0
+                stallStartTime = nil
+                // Only emit recovery for stalls longer than one frame interval (~33ms)
+                // to avoid spamming on normal inter-burst gaps.
+                if stallDurationMs > 50.0 {
+                    recoveryEvent = .recovery(stallDurationMs: stallDurationMs)
+                }
+            }
         }
 
-        // Invoke stream health callback outside the lock to avoid deadlock. (Req 15.1, 15.2)
+        // Invoke stream health callbacks outside the lock to avoid deadlock. (Req 15.1, 15.2)
+        if let event = recoveryEvent {
+            onStreamHealth?(event)
+        }
         if let event = burstEvent {
             onStreamHealth?(event)
         }
@@ -247,7 +305,9 @@ final class JitterBuffer {
             baseRtpTimestamp = nil
             baseWallClock = nil
             lastReleasedTimestamp = nil
+            lastReleaseTime = nil
             emaInterval = nil
+            consecutiveStaleDiscards = 0
             isBuffering = true
             bufferingStartTime = nil
             recentArrivalTimes.removeAll()
@@ -289,16 +349,21 @@ final class JitterBuffer {
 
     // MARK: - Overflow Handling (Req 1.8)
 
-    /// Drops frames when the buffer exceeds 2× `bufferDepthMs` worth of frames.
+    /// Drops frames when the buffer exceeds the overflow limit.
     ///
     /// Strategy: drop oldest non-IDR frames first. If the buffer still exceeds
     /// the limit (degenerate all-IDR case), drop oldest IDR frames. The buffer
-    /// must always return to at or below 2× depth after overflow handling.
+    /// must always return to at or below the limit after overflow handling.
     ///
     /// Must be called while holding `_lock`.
     private func handleOverflow() {
-        // Max allowed frames: 2× effectiveDepthMs at ~30fps (~33ms per frame).
-        let maxAllowedFrames = max(1, (2 * effectiveDepthMs) / 33)
+        // Max allowed frames: 5× effectiveDepthMs at ~30fps (~33ms per frame).
+        // The 5× multiplier accommodates TCP burst recovery after stalls —
+        // the server sends a burst of frames to catch up, and we need room
+        // to absorb them while the playout clock drains the queue.
+        // At 150ms depth this gives 22 frames (~750ms), enough for typical
+        // TCP recovery bursts without triggering overflow spam.
+        let maxAllowedFrames = max(3, (5 * effectiveDepthMs) / 33)
 
         guard buffer.count > maxAllowedFrames else { return }
 
@@ -480,8 +545,10 @@ final class JitterBuffer {
         let frameToRelease: AccessUnit? = withLock {
             guard !buffer.isEmpty else { return nil }
 
-            // Buffering period: hold frames until bufferDepthMs has elapsed
-            // since the first enqueue after underrun/start. (Req 1.9)
+            // Initial buffering period: hold frames until bufferDepthMs has elapsed
+            // since the first enqueue after stream start or reset. (Req 1.9)
+            // Once complete, this does NOT re-engage on momentary buffer empties —
+            // that was causing cascading stalls on streams that were previously stable.
             if isBuffering {
                 guard let startTime = bufferingStartTime else { return nil }
                 let elapsed = now - startTime
@@ -489,7 +556,7 @@ final class JitterBuffer {
                 if elapsed < requiredMs {
                     return nil
                 }
-                // Buffering period complete — begin releasing.
+                // Initial buffering period complete — begin releasing.
                 isBuffering = false
 
                 // Recovery from underrun: emit .recovery with stall duration. (Req 15.1, 15.2)
@@ -512,6 +579,7 @@ final class JitterBuffer {
                 baseRtpTimestamp = frame.rtpTimestamp
                 baseWallClock = now
                 lastReleasedTimestamp = frame.rtpTimestamp
+                lastReleaseTime = now
                 buffer.removeFirst()
                 _totalFramesReleased += 1
                 return frame
@@ -528,25 +596,36 @@ final class JitterBuffer {
             // Check if enough wall-clock time has passed since the base to release this frame.
             let targetWallClock = baseWallClock! + computePlayout(for: frame)
             if now < targetWallClock - 0.0005 {
-                // Not yet time to release this frame.
-                return nil
+                // Playout clock watchdog: if frames are buffered but none have
+                // been released for >2s, the playout clock has drifted ahead
+                // (e.g. due to main-thread stall during fullscreen transition).
+                // Resync by rebasing the playout clock to the current frame.
+                if let lastRelease = lastReleaseTime,
+                   (now - lastRelease) > Self.playoutWatchdogThreshold {
+                    baseRtpTimestamp = frame.rtpTimestamp
+                    baseWallClock = now
+                    os_log("JitterBuffer: watchdog resync — playout clock drifted (%.1fs since last release), rebasing",
+                           log: Self.log, type: .info, now - lastRelease)
+                    // Fall through to release this frame immediately.
+                } else {
+                    // Not yet time to release this frame.
+                    return nil
+                }
             }
 
             buffer.removeFirst()
             lastReleasedTimestamp = frame.rtpTimestamp
+            lastReleaseTime = now
             _totalFramesReleased += 1
 
             // Update output FPS estimate.
             updateOutputFps(now: now)
 
-            // If buffer is now empty, enter buffering state for next batch. (Req 1.9)
-            // Also record stall start time and emit .stall event. (Req 15.1, 15.2)
+            // Track stall/recovery for diagnostics when buffer empties,
+            // but do NOT re-enter full buffering mode — just record the stall.
             if buffer.isEmpty {
-                isBuffering = true
-                bufferingStartTime = nil
-                stallStartTime = now
-                // Only emit stall if we don't already have a recovery event queued
-                if healthEvent == nil {
+                if stallStartTime == nil {
+                    stallStartTime = now
                     healthEvent = .stall(timestamp: now)
                 }
             }
@@ -690,13 +769,12 @@ final class JitterBuffer {
             _totalFramesReleased += 1
 
             if buffer.isEmpty {
-                isBuffering = true
-                bufferingStartTime = nil
-                let now = ProcessInfo.processInfo.systemUptime
-                stallStartTime = now
-                // Only emit stall if we don't already have a recovery event queued
-                if healthEvent == nil {
-                    healthEvent = .stall(timestamp: now)
+                if stallStartTime == nil {
+                    let now = ProcessInfo.processInfo.systemUptime
+                    stallStartTime = now
+                    if healthEvent == nil {
+                        healthEvent = .stall(timestamp: now)
+                    }
                 }
             }
 
