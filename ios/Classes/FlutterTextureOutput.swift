@@ -87,20 +87,14 @@ final class FlutterTextureOutput: NSObject, FlutterTexture {
     /// (catching up after a jitter/stall) from flooding the main-thread dispatch
     /// queue and delaying texture notifications for other concurrent streams.
     ///
-    /// The incoming CVPixelBuffer is explicitly retained via CVPixelBufferRetain
-    /// so that VideoToolbox cannot recycle the backing IOSurface while Flutter's
-    /// Metal renderer is still accessing the texture. Without this, a race
-    /// between the decoder's buffer pool reclaim and the GPU's texture read
-    /// causes EXC_BAD_ACCESS in TextureMipmapLevelCount (PANDA-WATCH-24).
+    /// The incoming CVPixelBuffer is stored as a strong reference so that
+    /// VideoToolbox cannot recycle the backing IOSurface while Flutter's
+    /// Metal renderer is still accessing the texture. Swift's ARC retains
+    /// the buffer automatically when assigned to `latestPixelBuffer` and
+    /// releases the previous buffer on reassignment (PANDA-WATCH-24).
     func onNewFrame(_ pixelBuffer: CVPixelBuffer) {
-        // Retain the buffer so the decoder pool cannot reclaim it while we hold it.
-        CVPixelBufferRetain(pixelBuffer)
-
         let shouldNotify = withLock {
-            // Release the previous buffer now that we have a replacement.
-            if let prev = latestPixelBuffer {
-                CVPixelBufferRelease(prev)
-            }
+            // ARC releases the previous buffer when we replace the reference.
             latestPixelBuffer = pixelBuffer
             if pendingTextureNotification {
                 // A notification is already queued — it will pick up this newer buffer.
@@ -157,9 +151,7 @@ final class FlutterTextureOutput: NSObject, FlutterTexture {
         let (registry, id) = withLock { () -> (FlutterTextureRegistry?, Int64) in
             let reg = textureRegistry
             let tid = textureId
-            if let buf = latestPixelBuffer {
-                CVPixelBufferRelease(buf)
-            }
+            // ARC releases the buffer when we nil the reference.
             latestPixelBuffer = nil
             pendingTextureNotification = false
             textureRegistry = nil
