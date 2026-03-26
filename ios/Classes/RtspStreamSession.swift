@@ -360,7 +360,10 @@ final class RtspStreamSession: NSObject {
         assembler?.flush()
 
         // 7. Stop decoder (invalidates VTDecompressionSession)
-        decoder?.stop()
+        // Use stopSync to ensure all in-flight VT callbacks complete before
+        // the session is deallocated — prevents EXC_BAD_ACCESS when the
+        // Unmanaged refcon becomes a dangling pointer (PANDA-WATCH-24).
+        decoder?.stopSync()
 
         // 8. Unregister texture
         textureOutput?.stop()
