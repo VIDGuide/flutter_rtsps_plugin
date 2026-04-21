@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/services.dart';
 
 import 'rtsp_exception.dart';
@@ -108,11 +110,42 @@ class RtspStreamController {
   ///
   /// Events include [RtspPlayingEvent], [RtspErrorEvent], and
   /// [RtspStoppedEvent].
+  ///
+  /// The returned stream gracefully handles the case where the native session
+  /// has already been torn down when Dart cancels the subscription. This
+  /// prevents [MissingPluginException] crashes during MQTT reconnection
+  /// (PANDA-WATCH-3M).
   Stream<RtspStreamEvent> streamEvents(int streamId) {
     final eventChannel = EventChannel(
       'flutter_rtsps_plugin/events/$streamId',
     );
-    return eventChannel.receiveBroadcastStream().expand(_mapEvents);
+    // Wrap the broadcast stream so that MissingPluginException during cancel
+    // (native session already torn down) is swallowed instead of crashing.
+    final controller = StreamController<RtspStreamEvent>.broadcast();
+    StreamSubscription? sub;
+    controller.onListen = () {
+      sub = eventChannel.receiveBroadcastStream().expand(_mapEvents).listen(
+        controller.add,
+        onError: (e) {
+          // Swallow MissingPluginException — it means the native side already
+          // cleaned up the event channel (race during stop/dispose).
+          if (e is MissingPluginException) return;
+          controller.addError(e);
+        },
+        onDone: () {
+          if (!controller.isClosed) controller.close();
+        },
+      );
+    };
+    controller.onCancel = () {
+      try {
+        sub?.cancel();
+      } catch (_) {
+        // Swallow errors during cancel (native handler already removed)
+      }
+      sub = null;
+    };
+    return controller.stream;
   }
 
   /// Stops all active streams and releases all plugin resources.
