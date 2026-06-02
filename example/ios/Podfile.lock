@@ -26,7 +26,7 @@ EXTERNAL SOURCES:
 
 SPEC CHECKSUMS:
   Flutter: cabc95a1d2626b1b06e7179b784ebcf0c0cde467
-  flutter_rtsps_plugin: 6c92f393da09fdf37a25ef6fe3a214373d997f3f
+  flutter_rtsps_plugin: dc154ac99b2fcd412d688c089ef49cdcdb9073a5
   integration_test: 4a889634ef21a45d28d50d622cf412dc6d9f586e
   SwiftCheck: d1dd04d955cc76620b0f84e087536bd059a11c24
 

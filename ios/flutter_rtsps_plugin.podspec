@@ -14,7 +14,9 @@ and VideoToolbox. Purpose-built for Bambu Lab printer cameras with self-signed T
   s.license          = { :file => '../LICENSE' }
   s.author           = { 'PandaWatch' => 'dev@pandawatch.app' }
   s.source           = { :path => '.' }
-  s.source_files = 'Classes/**/*'
+  # Source files were moved under the Swift Package Manager directory layout.
+  # Both CocoaPods and SwiftPM build from the same sources.
+  s.source_files = 'flutter_rtsps_plugin/Sources/flutter_rtsps_plugin/**/*.swift'
   s.dependency 'Flutter'
   s.platform = :ios, '14.0'
 
@@ -22,9 +24,8 @@ and VideoToolbox. Purpose-built for Bambu Lab printer cameras with self-signed T
   s.pod_target_xcconfig = { 'DEFINES_MODULE' => 'YES', 'EXCLUDED_ARCHS[sdk=iphonesimulator*]' => 'i386' }
   s.swift_version = '5.9'
 
-  # If your plugin requires a privacy manifest, for example if it uses any
-  # required reason APIs, update the PrivacyInfo.xcprivacy file to describe your
-  # plugin's privacy impact, and then uncomment this line. For more information,
-  # see https://developer.apple.com/documentation/bundleresources/privacy_manifest_files
-  # s.resource_bundles = {'flutter_rtsps_plugin_privacy' => ['Resources/PrivacyInfo.xcprivacy']}
+  # Privacy manifest describing the plugin's (empty) privacy impact. Lives
+  # alongside the sources under the SwiftPM layout; bundled here for CocoaPods.
+  # See https://developer.apple.com/documentation/bundleresources/privacy_manifest_files
+  s.resource_bundles = {'flutter_rtsps_plugin_privacy' => ['flutter_rtsps_plugin/Sources/flutter_rtsps_plugin/PrivacyInfo.xcprivacy']}
 end
