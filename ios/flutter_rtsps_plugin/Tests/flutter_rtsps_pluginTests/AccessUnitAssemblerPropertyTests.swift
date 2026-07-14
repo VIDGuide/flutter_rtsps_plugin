@@ -242,4 +242,96 @@ final class AccessUnitAssemblerPropertyTests: XCTestCase {
                 && au.isIDR == true // slice2 is type 5
         }
     }
+
+    // MARK: - Timestamp-Change Frame Boundary Fallback
+
+    /// A new RTP timestamp closes the previous access unit even when the
+    /// previous frame's marker bit was never set. This guards against
+    /// encoders that drop/misplace the marker bit (observed on the H2C under
+    /// load), which would otherwise merge two frames into one malformed unit.
+    func testTimestampChangeClosesPreviousFrameWithoutMarker() {
+        let assembler = AccessUnitAssembler()
+        var emitted: [AccessUnit] = []
+        assembler.onAccessUnit = { emitted.append($0) }
+
+        // Frame 1: a single slice at T=1000, NO marker bit.
+        let slice1 = Data([(2 << 5) | 1, 0x11])
+        assembler.feedNalUnit(RtpNalUnit(data: slice1, isFrameComplete: false,
+                                         rtpTimestamp: 1000, sequenceNumber: 10))
+
+        // Nothing emitted yet — no marker, no timestamp change.
+        XCTAssertEqual(emitted.count, 0)
+
+        // Frame 2: a slice at T=4000 (new timestamp), also NO marker bit.
+        // Arrival of the new timestamp must flush frame 1.
+        let slice2 = Data([(2 << 5) | 1, 0x22])
+        assembler.feedNalUnit(RtpNalUnit(data: slice2, isFrameComplete: false,
+                                         rtpTimestamp: 4000, sequenceNumber: 11))
+
+        XCTAssertEqual(emitted.count, 1, "New RTP timestamp should close the previous frame")
+        XCTAssertEqual(emitted[0].rtpTimestamp, 1000, "Emitted AU carries the previous frame's timestamp")
+        XCTAssertEqual(emitted[0].sequenceNumber, 10, "Emitted AU carries the previous frame's last seq")
+        XCTAssertEqual(emitted[0].nalUnits, [slice1])
+
+        // Frame 2 finally gets its marker bit at T=4000.
+        let slice2End = Data([(2 << 5) | 1, 0x23])
+        assembler.feedNalUnit(RtpNalUnit(data: slice2End, isFrameComplete: true,
+                                         rtpTimestamp: 4000, sequenceNumber: 12))
+
+        XCTAssertEqual(emitted.count, 2)
+        XCTAssertEqual(emitted[1].rtpTimestamp, 4000)
+        XCTAssertEqual(emitted[1].sequenceNumber, 12)
+        XCTAssertEqual(emitted[1].nalUnits, [slice2, slice2End],
+                       "Frame 2 accumulates both of its NALs")
+    }
+
+    /// Regression: a normal single-timestamp frame terminated by a marker bit
+    /// still emits exactly one access unit (the timestamp-change fallback must
+    /// not fire spuriously when marker bits are reliable).
+    func testReliableMarkerBitEmitsExactlyOncePerFrame() {
+        let assembler = AccessUnitAssembler()
+        var emitted: [AccessUnit] = []
+        assembler.onAccessUnit = { emitted.append($0) }
+
+        // Two multi-NAL frames, each properly terminated by a marker bit.
+        for (ts, seqBase) in [(UInt32(1000), UInt16(10)), (UInt32(4000), UInt16(20))] {
+            assembler.feedNalUnit(RtpNalUnit(data: Data([(2 << 5) | 1, 0x01]),
+                                             isFrameComplete: false,
+                                             rtpTimestamp: ts, sequenceNumber: seqBase))
+            assembler.feedNalUnit(RtpNalUnit(data: Data([(2 << 5) | 5, 0x02]),
+                                             isFrameComplete: true,
+                                             rtpTimestamp: ts, sequenceNumber: seqBase + 1))
+        }
+
+        XCTAssertEqual(emitted.count, 2, "Each marker-terminated frame emits exactly once")
+        XCTAssertEqual(emitted[0].rtpTimestamp, 1000)
+        XCTAssertEqual(emitted[0].nalUnits.count, 2)
+        XCTAssertEqual(emitted[1].rtpTimestamp, 4000)
+        XCTAssertEqual(emitted[1].nalUnits.count, 2)
+    }
+
+    /// A missed marker followed by the next frame's SPS/PPS (parameter sets
+    /// carry the new timestamp) still flushes the previous frame correctly.
+    func testTimestampChangeViaParameterSetFlushesPreviousFrame() {
+        let assembler = AccessUnitAssembler()
+        var emitted: [AccessUnit] = []
+        var params: [(Data, UInt8)] = []
+        assembler.onAccessUnit = { emitted.append($0) }
+        assembler.onParameterSet = { params.append(($0, $1)) }
+
+        // Frame 1 slice at T=1000, marker dropped.
+        let slice1 = Data([(2 << 5) | 1, 0xAA])
+        assembler.feedNalUnit(RtpNalUnit(data: slice1, isFrameComplete: false,
+                                         rtpTimestamp: 1000, sequenceNumber: 30))
+
+        // Frame 2 begins with SPS at T=4000 — new timestamp flushes frame 1.
+        let sps = Data([(3 << 5) | 7, 0xBB])
+        assembler.feedNalUnit(RtpNalUnit(data: sps, isFrameComplete: false,
+                                         rtpTimestamp: 4000, sequenceNumber: 31))
+
+        XCTAssertEqual(emitted.count, 1, "SPS with a new timestamp flushes the prior frame")
+        XCTAssertEqual(emitted[0].rtpTimestamp, 1000)
+        XCTAssertEqual(emitted[0].nalUnits, [slice1])
+        XCTAssertEqual(params.count, 1, "SPS is forwarded, not merged into the flushed frame")
+    }
 }

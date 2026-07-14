@@ -31,7 +31,6 @@ final class RtspStreamSession: NSObject {
     private var rtcpSender: RtcpSender?
     private var decoder: H264Decoder?
     private var textureOutput: FlutterTextureOutput?
-    private var udpMediaTransport: UdpMediaTransport?
 
     // MARK: - Private — new pipeline components
 
@@ -130,9 +129,9 @@ final class RtspStreamSession: NSObject {
         // Check for cancellation after connect (Defect 1.7)
         try Task.checkCancellation()
 
-        // Run RTSP handshake — force TCP interleaved transport for live streams.
-        // UDP has massive packet loss on WiFi (90+ FU-A seq gaps on H2C).
-        let handshakeResult = try await sm.runHandshake(preferUdp: false)
+        // Run RTSP handshake — TCP interleaved transport only (see
+        // RtspStateMachine.runHandshake for why UDP was removed entirely).
+        let handshakeResult = try await sm.runHandshake()
         let videoTrack = handshakeResult.videoTrack
         os_log("RtspStreamSession[%d]: handshake complete", log: log, type: .info, streamId)
 
@@ -170,9 +169,8 @@ final class RtspStreamSession: NSObject {
         let demux = RtpDemuxer(transport: transport)
 
         // Create AccessUnitAssembler and JitterBuffer for the new pipeline.
-        // Transport mode: UDP if negotiated, TCP otherwise.
-        let transportMode: TransportMode = handshakeResult.udpTransport != nil ? .udp : .tcp
-        let jbConfig = JitterBufferConfig(transportMode: transportMode)
+        // Transport is always TCP interleaved (see runHandshake).
+        let jbConfig = JitterBufferConfig(transportMode: .tcp)
         let jb = JitterBuffer(config: jbConfig)
         let asm = AccessUnitAssembler()
 
@@ -213,54 +211,12 @@ final class RtspStreamSession: NSObject {
         self.assembler = asm
         self.jitterBuffer = jb
 
-        // Check if UDP transport was negotiated
-        if let udpInfo = handshakeResult.udpTransport {
-            // UDP path: receive RTP/RTCP over UDP sockets instead of TCP interleaved.
-            // This bypasses TCP/TLS backpressure that causes stream stalling on
-            // some Bambu printer firmware (notably H2C).
-            let udpTransport = UdpMediaTransport(info: udpInfo)
-            udpTransport.onRtpPacket = { [weak demux] packet in
-                demux?.feedRtpPacket(packet)
-            }
-            udpTransport.onRtcpPacket = { [weak rtcp] data in
-                rtcp?.processRtcpPacket(data)
-            }
-            udpTransport.onError = { [weak self] error in
-                self?.handleError(error)
-            }
-            // Wire RTCP sender to use UDP instead of TCP interleaved
-            rtcp.udpSendHandler = { [weak udpTransport] data in
-                udpTransport?.sendRtcp(data)
-            }
-            try udpTransport.start()
-            self.udpMediaTransport = udpTransport
-            os_log("RtspStreamSession[%d]: using UDP transport (server %{public}@:%u/%u)",
-                   log: log, type: .info, streamId,
-                   udpInfo.serverHost, udpInfo.serverRtpPort, udpInfo.serverRtcpPort)
-
-            // Start a TCP drain loop to prevent the RTSP signaling connection's
-            // receive buffer from filling up. LIVE555 may send RTCP Sender Reports
-            // (or even interleaved RTP) on the TCP channel regardless of the
-            // negotiated UDP transport. If nobody reads from the TCP socket, the
-            // kernel's receive window closes, the server's send buffer fills, and
-            // the server blocks — stalling the encoder for ALL transports including
-            // UDP. The demuxer's read loop handles this: it reads and discards
-            // TCP interleaved RTP data (drainOnly mode) while still forwarding
-            // RTCP to the sender. Video data comes exclusively from UDP.
-            demux.drainOnly = true
-            if let leftover = handshakeResult.remainingData {
-                demux.seedData(leftover)
-            }
-            demux.start()
-        } else {
-            // TCP interleaved path: seed leftover bytes and start demuxer read loop
-            if let leftover = handshakeResult.remainingData {
-                demux.seedData(leftover)
-            }
-            demux.start()
+        // TCP interleaved path: seed leftover bytes and start demuxer read loop
+        if let leftover = handshakeResult.remainingData {
+            demux.seedData(leftover)
         }
+        demux.start()
 
-        // Start RTCP sender (works for both UDP and TCP paths)
         rtcp.start()
 
         // Start jitter buffer release timer after pipeline is fully wired
@@ -278,11 +234,10 @@ final class RtspStreamSession: NSObject {
         self.reconnectionManager = rm
 
         // SDP diagnostic logging (Req 11.1, 11.2)
-        os_log("RtspStreamSession[%d]: SDP summary — codec: H264, control: %{public}@, SPS/PPS: %{public}@, transport: %{public}@",
+        os_log("RtspStreamSession[%d]: SDP summary — codec: H264, control: %{public}@, SPS/PPS: %{public}@, transport: TCP",
                log: log, type: .info, streamId,
                videoTrack.controlUrl,
-               videoTrack.sps != nil ? "from SDP" : "awaiting in-band",
-               transportMode == .udp ? "UDP" : "TCP")
+               videoTrack.sps != nil ? "from SDP" : "awaiting in-band")
 
         os_log("RtspStreamSession[%d]: streaming started, textureId=%lld",
                log: log, type: .info, streamId, textureOut.textureId)
@@ -353,9 +308,6 @@ final class RtspStreamSession: NSObject {
         // 5. Stop demuxer read loop
         demuxer?.stop()
 
-        // 5b. Stop UDP media transport if active
-        udpMediaTransport?.stop()
-
         // 6. Flush assembler
         assembler?.flush()
 
@@ -375,7 +327,6 @@ final class RtspStreamSession: NSObject {
         rtcpSender = nil
         decoder = nil
         textureOutput = nil
-        udpMediaTransport = nil
         assembler = nil
         jitterBuffer = nil
         reconnectionManager = nil
@@ -403,7 +354,6 @@ final class RtspStreamSession: NSObject {
         let oldTransport = transport
         let oldStateMachine = stateMachine
         let oldRtcpSender = rtcpSender
-        let oldUdpTransport = udpMediaTransport
 
         // Build new transport + state machine
         let newTransport = RtspTransport()
@@ -425,8 +375,8 @@ final class RtspStreamSession: NSObject {
         let port = UInt16(parsed.port ?? defaultPort)
         try await newTransport.connect(host: host, port: port)
 
-        // Run handshake on new connection — force TCP (same as start())
-        let handshakeResult = try await newSm.runHandshake(preferUdp: false)
+        // Run handshake on new connection — TCP interleaved only (same as start())
+        let handshakeResult = try await newSm.runHandshake()
         let videoTrack = handshakeResult.videoTrack
 
         // Initialize decoder with new SPS/PPS if available
@@ -481,35 +431,10 @@ final class RtspStreamSession: NSObject {
             newRtcp?.updateStats(stats)
         }
 
-        // Handle UDP vs TCP for new connection
-        if let udpInfo = handshakeResult.udpTransport {
-            let newUdp = UdpMediaTransport(info: udpInfo)
-            newUdp.onRtpPacket = { [weak newDemux] packet in
-                newDemux?.feedRtpPacket(packet)
-            }
-            newUdp.onRtcpPacket = { [weak newRtcp] data in
-                newRtcp?.processRtcpPacket(data)
-            }
-            newUdp.onError = { [weak self] error in
-                self?.handleError(error)
-            }
-            newRtcp.udpSendHandler = { [weak newUdp] data in
-                newUdp?.sendRtcp(data)
-            }
-            try newUdp.start()
-            self.udpMediaTransport = newUdp
-
-            newDemux.drainOnly = true
-            if let leftover = handshakeResult.remainingData {
-                newDemux.seedData(leftover)
-            }
-            newDemux.start()
-        } else {
-            if let leftover = handshakeResult.remainingData {
-                newDemux.seedData(leftover)
-            }
-            newDemux.start()
+        if let leftover = handshakeResult.remainingData {
+            newDemux.seedData(leftover)
         }
+        newDemux.start()
 
         newRtcp.start()
 
@@ -523,7 +448,6 @@ final class RtspStreamSession: NSObject {
         // Tear down old pipeline
         oldRtcpSender?.stop()
         oldDemuxer?.stop()
-        oldUdpTransport?.stop()
         oldAssembler?.flush()
         await oldStateMachine?.teardown()
         oldTransport?.close()

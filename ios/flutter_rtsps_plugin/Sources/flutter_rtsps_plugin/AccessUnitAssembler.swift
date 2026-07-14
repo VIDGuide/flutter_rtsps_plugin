@@ -31,6 +31,16 @@ final class AccessUnitAssembler {
     /// Tracks whether any accumulated NAL is an IDR slice (type 5).
     private var hasIDR: Bool = false
 
+    /// RTP timestamp of the frame currently being accumulated (the timestamp
+    /// shared by all NALs of one access unit). Used to detect a frame boundary
+    /// when the RTP timestamp changes — see `feedNalUnit`.
+    private var pendingTimestamp: UInt32?
+
+    /// Sequence number of the most recently accumulated NAL, used as the
+    /// emitted access unit's sequence number when a frame is closed by a
+    /// timestamp change rather than a marker bit.
+    private var pendingSequenceNumber: UInt16 = 0
+
     /// Maximum NAL units before overflow discard (Req 6.3).
     private static let maxPendingNalUnits = 100
 
@@ -56,6 +66,22 @@ final class AccessUnitAssembler {
 
         let nalType = unit.data[unit.data.startIndex] & 0x1F
 
+        // Timestamp-change frame boundary (RFC 6184 §5.1: all NALs of one access
+        // unit share an RTP timestamp; a new timestamp begins a new access unit).
+        // If we have NALs accumulated for a previous timestamp and this NAL
+        // carries a different one, the previous frame is complete even though its
+        // marker bit was never seen. This is a fallback for encoders that drop or
+        // misplace the marker bit — observed on the Bambu H2C under load — which
+        // would otherwise cause two frames to be merged into one malformed access
+        // unit (corruption / stutter). It mirrors how FFmpeg's H.264 depacketizer
+        // delimits frames. When marker bits are reliable this path never fires,
+        // because the marker emit below already drained `pendingNalUnits`.
+        if !pendingNalUnits.isEmpty,
+           let pendingTs = pendingTimestamp,
+           unit.rtpTimestamp != pendingTs {
+            emitAccessUnit(timestamp: pendingTs, sequenceNumber: pendingSequenceNumber)
+        }
+
         // Forward parameter sets via dedicated callback.
         if nalType == 7 || nalType == 8 {
             onParameterSet?(unit.data, nalType)
@@ -73,10 +99,13 @@ final class AccessUnitAssembler {
                 )
                 pendingNalUnits.removeAll()
                 hasIDR = false
+                pendingTimestamp = nil
                 return
             }
 
             pendingNalUnits.append(unit.data)
+            pendingTimestamp = unit.rtpTimestamp
+            pendingSequenceNumber = unit.sequenceNumber
 
             if nalType == 5 {
                 hasIDR = true
@@ -85,22 +114,31 @@ final class AccessUnitAssembler {
 
         // Marker bit → emit the complete access unit.
         if unit.isFrameComplete && !pendingNalUnits.isEmpty {
-            let accessUnit = AccessUnit(
-                nalUnits: pendingNalUnits,
-                rtpTimestamp: unit.rtpTimestamp,
-                sequenceNumber: unit.sequenceNumber,
-                arrivalTime: ProcessInfo.processInfo.systemUptime,
-                isIDR: hasIDR
-            )
-            pendingNalUnits.removeAll()
-            hasIDR = false
-            onAccessUnit?(accessUnit)
+            emitAccessUnit(timestamp: unit.rtpTimestamp, sequenceNumber: unit.sequenceNumber)
         }
+    }
+
+    /// Emits the accumulated NAL units as a complete `AccessUnit` and resets
+    /// the pending state. No-op if nothing is accumulated.
+    private func emitAccessUnit(timestamp: UInt32, sequenceNumber: UInt16) {
+        guard !pendingNalUnits.isEmpty else { return }
+        let accessUnit = AccessUnit(
+            nalUnits: pendingNalUnits,
+            rtpTimestamp: timestamp,
+            sequenceNumber: sequenceNumber,
+            arrivalTime: ProcessInfo.processInfo.systemUptime,
+            isIDR: hasIDR
+        )
+        pendingNalUnits.removeAll()
+        hasIDR = false
+        pendingTimestamp = nil
+        onAccessUnit?(accessUnit)
     }
 
     /// Discard any partially accumulated frame. Called on stream reset.
     func flush() {
         pendingNalUnits.removeAll()
         hasIDR = false
+        pendingTimestamp = nil
     }
 }

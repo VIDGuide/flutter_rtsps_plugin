@@ -29,12 +29,6 @@ final class RtcpSender {
     private let transport: RtspTransport
     private let onError: (Error) -> Void
 
-    /// Optional UDP send handler. When set, RTCP packets are sent via this
-    /// closure (raw RTCP, no TCP interleaved framing) instead of through
-    /// the TCP transport. Set by `RtspStreamSession` when UDP transport
-    /// is negotiated.
-    var udpSendHandler: ((Data) -> Void)?
-
     private var timer: DispatchSourceTimer?
     private let timerQueue: DispatchQueue
 
@@ -312,7 +306,7 @@ final class RtcpSender {
     // MARK: - Packet Construction and Send
 
     /// Builds an RTCP Receiver Report packet, wraps it in a TCP interleaved
-    /// frame (or sends raw over UDP), and writes it via the transport.
+    /// frame, and writes it via the transport.
     private func sendReceiverReport() {
         // Skip this tick if a previous send is still in flight
         guard !isSending else {
@@ -333,23 +327,6 @@ final class RtcpSender {
         let diagSrCount = srCount
         let diagPktCount = stats.packetCount
 
-        // UDP path: send raw RTCP packet, no interleaved framing
-        if let udpSend = udpSendHandler {
-            udpSend(rtcpPacket)
-            isSending = false
-            if diagStall {
-                os_log("RtcpSender: sent RR [STALL] seq=%u pkts=%u jitter=%u lsr=0x%08x rr#%u sr#%u",
-                       log: log, type: .info,
-                       diagSeq, diagPktCount, diagJitter, diagLsr, diagRrCount, diagSrCount)
-            } else {
-                os_log("RtcpSender: sent RR seq=%u pkts=%u jitter=%u lsr=0x%08x",
-                       log: log, type: .debug,
-                       diagSeq, diagPktCount, diagJitter, diagLsr)
-            }
-            return
-        }
-
-        // TCP path: wrap in interleaved frame
         let frame = wrapInInterleavedFrame(channel: 1, payload: rtcpPacket)
 
         Task { [weak self] in

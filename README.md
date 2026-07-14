@@ -8,9 +8,7 @@ beyond ~1.8 seconds.
 ## Features
 
 - Full RTSP state machine: OPTIONS → DESCRIBE → SETUP → PLAY → TEARDOWN
-- Automatic UDP transport negotiation with TCP interleaved fallback
-- TCP interleaved RTP/RTCP over TLS (`rtsps://`)
-- UDP RTP/RTCP media transport (bypasses TCP/TLS backpressure)
+- TCP interleaved RTP/RTCP over TLS (`rtsps://`) — the only transport used
 - H.264 hardware decoding via `VTDecompressionSession`
 - Zero-copy frame delivery to Flutter via `TextureRegistry`
 - Automatic self-signed certificate acceptance
@@ -40,11 +38,7 @@ beyond ~1.8 seconds.
 ├──────────┤          │           ├───────────────────┤
 │ RtspTrans│          │           │FlutterTextureOutput│
 │ port(TLS)│          │           │                   │
-├──────────┘          │           └───────────────────┘
-│ UdpMedia            │
-│ Transport           │
-│ (optional)          │
-└─────────────────────┘
+└──────────┘          │           └───────────────────┘
 ```
 
 ### Component overview
@@ -53,9 +47,8 @@ beyond ~1.8 seconds.
 |------|---------------|
 | `RtspStreamManager.swift` | Flutter MethodChannel/EventChannel bridge, stream lifecycle |
 | `RtspStreamSession.swift` | Coordinates all components for one stream |
-| `RtspStateMachine.swift` | RTSP handshake, Digest auth, UDP/TCP SETUP negotiation |
+| `RtspStateMachine.swift` | RTSP handshake, Digest auth, TCP SETUP negotiation |
 | `RtspTransport.swift` | TLS TCP connection via NWConnection |
-| `UdpMediaTransport.swift` | UDP RTP/RTCP sockets via NWConnection |
 | `RtpDemuxer.swift` | TCP interleaved frame extraction, RTP parsing, FU-A/STAP-A |
 | `RtcpSender.swift` | Periodic Receiver Reports, SR processing, stall detection |
 | `H264Decoder.swift` | VideoToolbox H.264 decoding, SPS/PPS management |
@@ -63,21 +56,15 @@ beyond ~1.8 seconds.
 | `SnapshotCapture.swift` | Single-frame RTSP capture → JPEG |
 | `SdpParser.swift` | SDP parsing for video track, SPS/PPS extraction |
 
-## Transport negotiation
+## Transport
 
-The plugin automatically negotiates the best transport for each stream:
-
-1. During SETUP, the plugin first requests **UDP transport** (`RTP/AVP/UDP;unicast`)
-2. If the server accepts (200 OK with `server_port=`), RTP/RTCP flow over UDP sockets
-3. If the server rejects (461 Unsupported Transport), the plugin falls back to **TCP interleaved** (`RTP/AVP/TCP;unicast;interleaved=0-1`)
-
-UDP transport is preferred because some Bambu printer firmware (notably the H2C) experiences
-TCP/TLS backpressure on its ARM CPU, causing periodic 5-10 second stream stalls. The encoder
-runs continuously but the TLS encryption layer can't drain the TCP send buffer fast enough,
-causing frames to accumulate and flush in bursts. UDP bypasses this entirely — the RTSP
-signaling still uses TLS/TCP, but the media stream flows over unencrypted UDP.
-
-Snapshot captures always use TCP (no UDP negotiation) since they only need a single frame.
+The plugin always negotiates **TCP interleaved** transport (`RTP/AVP/TCP;unicast;interleaved=0-1`)
+for both live streams and single-frame snapshots. An earlier version attempted UDP transport
+first (with TCP fallback) to work around suspected TCP/TLS backpressure on the H2C's ARM CPU,
+but UDP was removed entirely after testing showed severe packet loss on WiFi (90+ FU-A sequence
+gaps observed) — strictly worse than TCP for that printer, with no benefit on any other model.
+This also matches how go2rtc/FFmpeg (used by Home Assistant's Bambu integration) connect to the
+same printers.
 
 ## RTCP implementation
 
@@ -223,11 +210,10 @@ All errors are thrown as `RtspException` with a typed `code`:
 
 The plugin uses `os_log` with the subsystem `com.pandawatch.flutter_rtsps_plugin` and
 per-component categories (`RtspStateMachine`, `RtpDemuxer`, `RtcpSender`, `H264Decoder`,
-`UdpMediaTransport`, etc.). Key log points:
+etc.). Key log points:
 
 - Full RTSP handshake headers (OPTIONS, DESCRIBE, SETUP, PLAY)
 - SDP body line-by-line
-- Transport negotiation (UDP accepted/rejected, fallback to TCP)
 - Periodic RTP statistics (packets/sec, bitrate, sequence numbers)
 - Stall detection and recovery
 - RTCP SR/RR exchange with jitter and loss metrics

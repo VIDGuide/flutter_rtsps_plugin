@@ -44,14 +44,6 @@ final class RtpDemuxer {
     /// Used by RtcpSender to populate Receiver Report fields. (Req 3.2)
     var onRtpStats: ((RtpStats) -> Void)?
 
-    /// When `true`, the demuxer reads and discards TCP interleaved RTP data
-    /// without processing it. RTCP packets (channel 1) are still forwarded.
-    /// Used when UDP transport is active — the TCP read loop must continue
-    /// to drain the kernel receive buffer (preventing the server's send
-    /// buffer from filling and stalling the encoder) but the actual video
-    /// data arrives via UDP.
-    var drainOnly = false
-
     // MARK: - Private state
 
     private let transport: RtspTransport
@@ -202,11 +194,6 @@ final class RtpDemuxer {
                 while let frame = Self.extractFrame(from: &buf) {
                     switch frame.channel {
                     case 0:
-                        if drainOnly {
-                            // UDP is active — discard TCP RTP data silently.
-                            // We still need to read it to drain the kernel buffer.
-                            break
-                        }
                         processRtpPacket(frame.payload)
                     case 1:
                         rtcpCountSinceDiag += 1
@@ -513,14 +500,6 @@ final class RtpDemuxer {
                 sequenceNumber: UInt16(truncatingIfNeeded: lastSeq ?? 0)
             ))
         }
-    }
-
-    // MARK: - UDP Packet Feed
-
-    /// Processes a raw RTP packet received over UDP (no interleaved framing).
-    /// Called by `UdpMediaTransport.onRtpPacket` when using UDP transport.
-    func feedRtpPacket(_ packet: Data) {
-        processRtpPacket(packet)
     }
 
     // MARK: - Testing Shims

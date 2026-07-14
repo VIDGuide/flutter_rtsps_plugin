@@ -92,6 +92,23 @@ final class JitterBuffer {
     /// Set when the buffer empties during release; cleared on recovery.
     private var stallStartTime: TimeInterval?
 
+    /// Set true when the buffer drains to empty *after* playout has begun (an
+    /// underrun). On the next release the playout clock is re-anchored to the
+    /// resumed frame (see the rebase block in `releaseTimerFired`).
+    ///
+    /// Rationale: the playout clock is a fixed-latency schedule anchored once at
+    /// stream start (`baseWallClock + (rtpTS - baseRtpTS)/90000`). After an
+    /// underrun the wall clock keeps advancing while no frames play, so when
+    /// delivery resumes every buffered frame is already "past due" and the
+    /// release loop emits them back-to-back (up to ~1 frame/ms) — dumping a
+    /// whole burst into the decoder in a few milliseconds. Because the texture
+    /// layer only shows the newest decoded frame, that renders as a freeze
+    /// followed by a fast-forward jump. This is the primary cause of the H2C's
+    /// "jumpy" playback, since that printer delivers in bursts with gaps.
+    /// Re-anchoring to the resumed frame restarts paced playout from the resume
+    /// point so the backlog plays at its real frame rate instead of dumping.
+    private var needsPlayoutRebase: Bool = false
+
     /// Wall-clock time when the last frame was actually released via the timer.
     /// Used by the playout clock watchdog to detect drift stalls — if frames
     /// are buffered but none released for >2s, the playout clock is resynced.
@@ -312,6 +329,7 @@ final class JitterBuffer {
             bufferingStartTime = nil
             recentArrivalTimes.removeAll()
             stallStartTime = nil
+            needsPlayoutRebase = false
             // Reset adaptive state back to configured depth. (Req 13)
             adaptiveDepthMs = config.bufferDepthMs
             jitterSamples.removeAll()
@@ -585,6 +603,33 @@ final class JitterBuffer {
                 return frame
             }
 
+            // Re-anchor the playout clock after an underrun. See `needsPlayoutRebase`
+            // for the full rationale: without this, a delivery burst following a
+            // stall is released back-to-back (freeze-then-fast-forward jump).
+            // Re-anchoring to THIS frame restarts paced playout from the resume
+            // point so the burst plays out at its real frame rate.
+            if needsPlayoutRebase {
+                needsPlayoutRebase = false
+                baseRtpTimestamp = frame.rtpTimestamp
+                baseWallClock = now
+                lastReleasedTimestamp = frame.rtpTimestamp
+                lastReleaseTime = now
+                buffer.removeFirst()
+                _totalFramesReleased += 1
+                updateOutputFps(now: now)
+                // If that was the only buffered frame we're still underrunning —
+                // stay armed so the next arrival re-anchors again. This keeps
+                // latency minimal during trickle delivery (one frame at a time).
+                if buffer.isEmpty {
+                    needsPlayoutRebase = true
+                    if stallStartTime == nil {
+                        stallStartTime = now
+                        healthEvent = .stall(timestamp: now)
+                    }
+                }
+                return frame
+            }
+
             // Compute the RTP-timestamp-derived release interval and update EMA.
             // (Req 1.4, 1.5, 2.1, 2.2, 2.5)
             let rawDelta = Int32(bitPattern: frame.rtpTimestamp &- lastReleasedTimestamp!)
@@ -623,11 +668,15 @@ final class JitterBuffer {
 
             // Track stall/recovery for diagnostics when buffer empties,
             // but do NOT re-enter full buffering mode — just record the stall.
+            // Also arm the playout-clock rebase so the resumed stream (which,
+            // on the H2C, tends to arrive as a burst) plays out paced instead
+            // of being dumped to the decoder all at once.
             if buffer.isEmpty {
                 if stallStartTime == nil {
                     stallStartTime = now
                     healthEvent = .stall(timestamp: now)
                 }
+                needsPlayoutRebase = true
             }
 
             return frame

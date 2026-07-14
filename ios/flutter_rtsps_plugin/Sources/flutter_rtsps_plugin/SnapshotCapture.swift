@@ -105,10 +105,8 @@ final class SnapshotCapture {
         var demuxer: RtpDemuxer? = nil
         var decoder: H264Decoder? = nil
         var rtcpSender: RtcpSender? = nil
-        var udpTransport: UdpMediaTransport? = nil
 
         defer {
-            udpTransport?.stop()
             rtcpSender?.stop()
             demuxer?.stop()
             decoder?.stopSync()
@@ -119,13 +117,12 @@ final class SnapshotCapture {
         try await transport.connect(host: host, port: port)
         os_log("SnapshotCapture: transport connected to %{public}@:%u", log: log, type: .info, host, port)
 
-        // Run RTSP handshake (Req 6.1) — use TCP interleaved for snapshots.
-        // Snapshots only need a single decoded frame, so TCP's reliability
-        // matters more than UDP's lower latency. The H2C printer exhibits
-        // severe UDP packet loss (2-4s bursts then 5-7s stalls) that
-        // prevents the decoder from ever assembling a complete frame.
-        // Live stream sessions still use UDP for sustained playback.
-        let handshakeResult = try await stateMachine.runHandshake(preferUdp: false)
+        // Run RTSP handshake (Req 6.1) — TCP interleaved only. UDP transport
+        // was removed entirely (not just for snapshots): the H2C printer
+        // exhibited severe UDP packet loss on WiFi (2-4s bursts then 5-7s
+        // stalls) that prevented the decoder from ever assembling a complete
+        // frame, and every other supported model works fine over TCP.
+        let handshakeResult = try await stateMachine.runHandshake()
         let videoTrack = handshakeResult.videoTrack
         os_log("SnapshotCapture: handshake complete", log: log, type: .info)
 
@@ -176,33 +173,6 @@ final class SnapshotCapture {
         }
         demuxer = dmx
 
-        // Wire up UDP transport if the server accepted it
-        if let udpInfo = handshakeResult.udpTransport {
-            let udp = UdpMediaTransport(info: udpInfo)
-            udp.onRtpPacket = { [weak dmx] packet in
-                dmx?.feedRtpPacket(packet)
-            }
-            udp.onRtcpPacket = { [weak rtcp] data in
-                rtcp?.processRtcpPacket(data)
-            }
-            rtcp.udpSendHandler = { [weak udp] data in
-                udp?.sendRtcp(data)
-            }
-            try udp.start()
-            udpTransport = udp
-            os_log("SnapshotCapture: using UDP transport (server %{public}@:%u/%u)",
-                   log: log, type: .info,
-                   udpInfo.serverHost, udpInfo.serverRtpPort, udpInfo.serverRtcpPort)
-        }
-
-        // Always start the TCP demuxer read loop — even with UDP active,
-        // we need to drain any data LIVE555 sends on the TCP channel to
-        // prevent the server's send buffer from filling up and blocking.
-        // In UDP mode, the demuxer discards RTP data (drainOnly) and only
-        // forwards RTCP.
-        if handshakeResult.udpTransport != nil {
-            dmx.drainOnly = true
-        }
         if let leftover = handshakeResult.remainingData {
             dmx.seedData(leftover)
         }

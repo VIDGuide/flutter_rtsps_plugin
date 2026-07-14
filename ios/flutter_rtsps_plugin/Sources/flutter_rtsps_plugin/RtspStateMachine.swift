@@ -76,12 +76,20 @@ final class RtspStateMachine {
 
     /// Runs the full OPTIONS → DESCRIBE → SETUP → PLAY handshake.
     ///
+    /// Always negotiates TCP interleaved transport for the media (RTP/AVP/TCP).
+    /// UDP transport was previously attempted first with TCP fallback, but was
+    /// removed entirely: the H2C's severe UDP packet loss on WiFi (90+ FU-A
+    /// sequence gaps observed) made it strictly worse than TCP for this
+    /// printer, and every other supported model works fine over TCP. TCP-only
+    /// also matches how go2rtc/FFmpeg (used by Home Assistant's Bambu
+    /// integration) connect to the same printers.
+    ///
     /// - Returns: The parsed `SdpVideoTrack` from the DESCRIBE response.
     /// - Throws: `RtspError.timeout` if any request takes longer than 10 s,
     ///           `RtspError.authenticationFailed` if Digest auth fails,
     ///           `RtspError.noVideoTrack` if the SDP has no video section,
     ///           `RtspError.connectionFailed` for transport-level errors.
-    func runHandshake(preferUdp: Bool = true) async throws -> HandshakeResult {
+    func runHandshake() async throws -> HandshakeResult {
         // OPTIONS
         let optionsResponse = try await sendRequest(method: "OPTIONS", uri: url)
         os_log("RTSP OPTIONS %d %{public}@", log: log, type: .info,
@@ -111,78 +119,16 @@ final class RtspStateMachine {
         // Resolve the control URL (may be relative)
         let controlUrl = resolveControlUrl(videoTrack.controlUrl)
 
-        // SETUP — try UDP first (if preferred), fall back to TCP interleaved.
-        // The H2C's TLS+TCP path bottlenecks on the server's ARM CPU,
-        // causing periodic stalls. UDP bypasses TCP flow control entirely.
-        // Note: even over an rtsps:// connection, LIVE555 can accept UDP
-        // transport for the media — only the RTSP signaling uses TLS/TCP.
-        var useUdp = false
-        var serverRtpPort: UInt16 = 0
-        var serverRtcpPort: UInt16 = 0
-        let udpClientRtpPort: UInt16 = 50000 + UInt16.random(in: 0...999) * 2
-        let udpClientRtcpPort = udpClientRtpPort + 1
-
-        let setupResponse: RtspResponse
-
-        if preferUdp {
-            let udpTransportHeader = "RTP/AVP/UDP;unicast;client_port=\(udpClientRtpPort)-\(udpClientRtcpPort)"
-
-            let udpSetupResponse = try await sendRequest(method: "SETUP", uri: controlUrl, extraHeaders: [
-                "Transport": udpTransportHeader
-            ])
-            os_log("RTSP SETUP (UDP attempt) %d %{public}@", log: log, type: .info,
-                   udpSetupResponse.statusCode, udpSetupResponse.reason)
-            if let transportHeader = udpSetupResponse.headers["transport"] {
-                os_log("  Transport: %{public}@", log: log, type: .info, transportHeader)
-            }
-            logAllHeaders("SETUP-UDP", udpSetupResponse)
-
-            if udpSetupResponse.statusCode == 200,
-               let transportHeader = udpSetupResponse.headers["transport"],
-               transportHeader.lowercased().contains("rtp/avp") && !transportHeader.lowercased().contains("tcp") {
-                // Server accepted UDP — parse server_port from Transport header
-                useUdp = true
-                setupResponse = udpSetupResponse
-                let ports = Self.parseServerPorts(from: transportHeader)
-                serverRtpPort = ports.rtp
-                serverRtcpPort = ports.rtcp
-                os_log("RTSP SETUP: server accepted UDP (server_port=%u-%u, client_port=%u-%u)",
-                       log: log, type: .info, serverRtpPort, serverRtcpPort, udpClientRtpPort, udpClientRtcpPort)
-            } else {
-                // Server rejected UDP (461 or returned TCP) — fall back to TCP interleaved
-                os_log("RTSP SETUP: server rejected UDP (%d), falling back to TCP interleaved",
-                       log: log, type: .info, udpSetupResponse.statusCode)
-
-                if udpSetupResponse.statusCode == 200 {
-                    // Server returned 200 but with TCP transport — use it
-                    setupResponse = udpSetupResponse
-                } else {
-                    // Send a new SETUP requesting TCP interleaved
-                    let tcpSetupResponse = try await sendRequest(method: "SETUP", uri: controlUrl, extraHeaders: [
-                        "Transport": "RTP/AVP/TCP;unicast;interleaved=0-1"
-                    ])
-                    os_log("RTSP SETUP (TCP fallback) %d %{public}@", log: log, type: .info,
-                           tcpSetupResponse.statusCode, tcpSetupResponse.reason)
-                    if let transportHeader = tcpSetupResponse.headers["transport"] {
-                        os_log("  Transport: %{public}@", log: log, type: .info, transportHeader)
-                    }
-                    logAllHeaders("SETUP-TCP", tcpSetupResponse)
-                    setupResponse = tcpSetupResponse
-                }
-            }
-        } else {
-            // Direct TCP — no UDP attempt (used by SnapshotCapture)
-            let tcpSetupResponse = try await sendRequest(method: "SETUP", uri: controlUrl, extraHeaders: [
-                "Transport": "RTP/AVP/TCP;unicast;interleaved=0-1"
-            ])
-            os_log("RTSP SETUP %d %{public}@", log: log, type: .info,
-                   tcpSetupResponse.statusCode, tcpSetupResponse.reason)
-            if let transportHeader = tcpSetupResponse.headers["transport"] {
-                os_log("  Transport: %{public}@", log: log, type: .info, transportHeader)
-            }
-            logAllHeaders("SETUP", tcpSetupResponse)
-            setupResponse = tcpSetupResponse
+        // SETUP — TCP interleaved only.
+        let setupResponse = try await sendRequest(method: "SETUP", uri: controlUrl, extraHeaders: [
+            "Transport": "RTP/AVP/TCP;unicast;interleaved=0-1"
+        ])
+        os_log("RTSP SETUP %d %{public}@", log: log, type: .info,
+               setupResponse.statusCode, setupResponse.reason)
+        if let transportHeader = setupResponse.headers["transport"] {
+            os_log("  Transport: %{public}@", log: log, type: .info, transportHeader)
         }
+        logAllHeaders("SETUP", setupResponse)
 
         if let sessionHeader = setupResponse.headers["session"] {
             os_log("  Session: %{public}@", log: log, type: .info, sessionHeader)
@@ -223,14 +169,7 @@ final class RtspStateMachine {
         return HandshakeResult(
             videoTrack: videoTrack,
             remainingData: leftover,
-            serverTimeout: serverTimeout,
-            udpTransport: useUdp ? UdpTransportInfo(
-                serverHost: host,
-                serverRtpPort: serverRtpPort,
-                serverRtcpPort: serverRtcpPort,
-                clientRtpPort: udpClientRtpPort,
-                clientRtcpPort: udpClientRtcpPort
-            ) : nil
+            serverTimeout: serverTimeout
         )
     }
 
@@ -538,24 +477,6 @@ final class RtspStateMachine {
         }
     }
 
-    // MARK: - Transport Parsing
-
-    /// Parses `server_port=XXXX-YYYY` from a SETUP Transport response header.
-    static func parseServerPorts(from transport: String) -> (rtp: UInt16, rtcp: UInt16) {
-        // Look for server_port=XXXX-YYYY
-        let pattern = "server_port=(\\d+)-(\\d+)"
-        if let regex = try? NSRegularExpression(pattern: pattern),
-           let match = regex.firstMatch(in: transport, range: NSRange(transport.startIndex..., in: transport)),
-           match.numberOfRanges >= 3,
-           let rtpRange = Range(match.range(at: 1), in: transport),
-           let rtcpRange = Range(match.range(at: 2), in: transport),
-           let rtp = UInt16(transport[rtpRange]),
-           let rtcp = UInt16(transport[rtcpRange]) {
-            return (rtp, rtcp)
-        }
-        return (6970, 6971) // LIVE555 defaults
-    }
-
     // MARK: - Digest Authentication
 
     private struct DigestChallenge {
@@ -648,18 +569,6 @@ final class RtspStateMachine {
     }
 }
 
-// MARK: - UdpTransportInfo
-
-/// UDP transport parameters negotiated during SETUP, used by the session
-/// to create UDP sockets for RTP/RTCP instead of TCP interleaved framing.
-struct UdpTransportInfo {
-    let serverHost: String
-    let serverRtpPort: UInt16
-    let serverRtcpPort: UInt16
-    let clientRtpPort: UInt16
-    let clientRtcpPort: UInt16
-}
-
 // MARK: - HandshakeResult
 
 /// Result of a successful RTSP handshake, containing the video track info,
@@ -674,8 +583,6 @@ struct HandshakeResult {
     /// Server session timeout in seconds parsed from the Session header's
     /// `timeout=N` parameter, or `nil` if not provided (Defect 1.13).
     let serverTimeout: Int?
-    /// UDP transport info if the server accepted UDP, or `nil` for TCP interleaved.
-    let udpTransport: UdpTransportInfo?
 }
 
 // MARK: - RtspResponse
