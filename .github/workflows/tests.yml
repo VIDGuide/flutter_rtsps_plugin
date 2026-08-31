@@ -98,11 +98,24 @@ jobs:
           echo "udid=$UDID" >> "$GITHUB_OUTPUT"
           echo "Using simulator $UDID"
 
+          # Boot ahead of xcodebuild and wait for the device to be ready.
+          # Letting xcodebuild boot it on demand is a common source of
+          # "failed to launch" errors on cold CI runners.
+          xcrun simctl boot "$UDID" || true
+          xcrun simctl bootstatus "$UDID" -b
+
       # The Runner scheme's test action picks up both the example app's
       # RunnerTests target and the plugin's SwiftPM test target, because Flutter
       # resolves the plugin as a local SwiftPM package in the workspace. Running
       # through the workspace means Flutter's own tooling links Flutter.framework,
       # so no manual framework search paths are needed.
+      #
+      # Parallel testing is disabled deliberately. By default xcodebuild spawns
+      # simulator clones ("Clone 2 of iPhone 16 Pro") and runs suites across
+      # them; on CI a clone intermittently fails to launch the host app
+      # (FBSOpenApplicationServiceErrorDomain Code=1), which surfaced as two
+      # unrelated tests failing while the other 83 passed. Running on the single
+      # booted device is slower but deterministic.
       - name: Run iOS tests
         working-directory: example/ios
         run: |
@@ -111,6 +124,8 @@ jobs:
             -workspace Runner.xcworkspace \
             -scheme Runner \
             -destination "id=${{ steps.sim.outputs.udid }}" \
+            -parallel-testing-enabled NO \
+            -maximum-concurrent-test-simulator-destinations 1 \
             CODE_SIGNING_ALLOWED=NO \
             | tee /tmp/xcodebuild.log
 
