@@ -134,35 +134,66 @@ jobs:
       # changes, xcodebuild would still exit 0 having run just the single
       # RunnerTests case, and the job would stay green while covering almost
       # nothing. Assert the real suites ran.
+      #
+      # xcodebuild has two result formats and they are not interchangeable:
+      #   serial:   Test Case '-[BundleName.SuiteName testName]' passed
+      #   parallel: Test case 'SuiteName.testName()' passed on 'Clone 1 of ...'
+      # A single loose regex mis-parses one or the other (in the parallel form
+      # the leading token is the suite, in the serial form it is the bundle), so
+      # both are matched explicitly.
       - name: Verify expected test suites ran
         run: |
-          PASSED=$(grep -c "^Test case .* passed" /tmp/xcodebuild.log || true)
-          echo "Test cases passed: $PASSED"
+          python3 <<'PY'
+          import re, sys
 
-          MISSING=0
-          for suite in \
-            AccessUnitAssemblerPropertyTests \
-            BugConditionExplorationTests \
-            JitterBufferConfigPropertyTests \
-            JitterBufferPropertyTests \
-            PreservationTests \
-            ReconnectionManagerPropertyTests \
-            RtpDemuxerPropertyTests \
-            RtpDemuxerTests \
-            RunnerTests \
-            SdpParserTests
-          do
-            if ! grep -q "Test case '$suite\." /tmp/xcodebuild.log; then
-              echo "::error::Expected test suite did not run: $suite"
-              MISSING=1
-            fi
-          done
-          [ "$MISSING" -eq 0 ] || exit 1
+          EXPECTED = {
+              "AccessUnitAssemblerPropertyTests",
+              "BugConditionExplorationTests",
+              "H264DecoderPropertyTests",
+              "JitterBufferConfigPropertyTests",
+              "JitterBufferPropertyTests",
+              "PreservationTests",
+              "ReconnectionManagerPropertyTests",
+              "RtpDemuxerPropertyTests",
+              "RtpDemuxerTests",
+              "RunnerTests",
+              "SdpParserTests",
+          }
+          MIN_CASES = 70  # 85 today; floored so routine test churn does not trip it
 
-          # 85 cases at time of writing. Floor it a little below that so adding
-          # or removing a case does not trip the guard, while a collapse to the
-          # lone RunnerTests case still fails loudly.
-          if [ "$PASSED" -lt 70 ]; then
-            echo "::error::Only $PASSED test cases ran; expected ~85. The Swift suite may not be building."
-            exit 1
-          fi
+          serial = re.compile(r"Test Case '-\[\w+\.(\w+) \w+\]' (passed|failed)")
+          parallel = re.compile(r"Test case '(\w+)\.\w+\(\)' (passed|failed)")
+
+          seen, passed, failed = {}, 0, 0
+          with open("/tmp/xcodebuild.log", errors="replace") as fh:
+              for line in fh:
+                  m = serial.search(line) or parallel.search(line)
+                  if not m:
+                      continue
+                  suite, outcome = m.group(1), m.group(2)
+                  seen.setdefault(suite, 0)
+                  seen[suite] += 1
+                  if outcome == "passed":
+                      passed += 1
+                  else:
+                      failed += 1
+
+          for suite in sorted(seen):
+              print(f"  {suite}: {seen[suite]} cases")
+          print(f"total passed={passed} failed={failed} suites={len(seen)}")
+
+          errors = []
+          missing = EXPECTED - seen.keys()
+          if missing:
+              errors.append("expected test suites did not run: " + ", ".join(sorted(missing)))
+          if failed:
+              errors.append(f"{failed} test case(s) failed")
+          if passed < MIN_CASES:
+              errors.append(
+                  f"only {passed} cases ran, expected at least {MIN_CASES}; "
+                  "the Swift suite may not be building"
+              )
+          for e in errors:
+              print(f"::error::{e}")
+          sys.exit(1 if errors else 0)
+          PY
