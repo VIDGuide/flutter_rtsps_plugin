@@ -53,6 +53,17 @@ final class H264Decoder {
     /// Exposed for property testing (Property 13: SPS/PPS identity check).
     private(set) var reinitCount: Int = 0
 
+    /// True while the decoder is waiting for a fresh IDR (keyframe) before
+    /// submitting further picture NAL units. Re-armed by
+    /// `initializeDecoderSync` and by any decode failure; cleared when an
+    /// access unit containing an IDR is accepted. Guarded by `queue`.
+    /// Internal (rather than private) so the test target can assert it.
+    var awaitingIDR: Bool = false
+
+    /// Number of access units dropped by the awaiting-IDR gate. Diagnostics /
+    /// test observation only.
+    private(set) var droppedWhileAwaitingIDRCount: Int = 0
+
     /// Per-instance serial queue. Uses a unique label so Instruments/os_log
     /// can distinguish between concurrent decoder instances (e.g. two printers
     /// streaming simultaneously). The `.userInteractive` QoS ensures decode
@@ -107,6 +118,10 @@ final class H264Decoder {
     /// Internal implementation — must be called on `queue`.
     private func initializeDecoderSync(sps: Data, pps: Data) throws {
         reinitCount += 1
+        // A (re)initialized session has no reference frames: wait for a fresh
+        // IDR before submitting picture NALs. Covers `initializeDecoder`,
+        // `updateParameterSets`, and in-band parameter-set changes.
+        awaitingIDR = true
         // Build the format description from SPS + PPS
         var spsBytes = [UInt8](sps)
         var ppsBytes = [UInt8](pps)
@@ -290,6 +305,12 @@ final class H264Decoder {
               let formatDesc = formatDescription,
               !nalUnits.isEmpty else { return }
 
+        // Awaiting-IDR gate: without a reference frame, VideoToolbox silently
+        // produces no output for P-frames (leaving the last pixel buffer on
+        // screen). Drop them instead of feeding undecodable data; the gate
+        // clears when an access unit containing an IDR is accepted.
+        guard shouldSubmitAccessUnit(nalUnits) else { return }
+
         // Build AVCC block buffer: each NAL unit prefixed with 4-byte BE length
         var avccData = Data()
         for nal in nalUnits {
@@ -378,8 +399,55 @@ final class H264Decoder {
         if decodeStatus != noErr {
             os_log("H264Decoder: VTDecompressionSessionDecodeFrame failed: %d",
                    log: log, type: .error, decodeStatus)
-            // Per-frame error: discard and continue (Req 4.5)
+            // Per-frame error: discard and continue (Req 4.5). The session may
+            // have lost its reference frames, so re-arm the IDR gate.
+            awaitingIDR = true
         }
+    }
+
+    // MARK: - Awaiting IDR Gate
+
+    /// Returns true if `nalUnits` contains an IDR slice (H.264 NAL unit type 5).
+    private static func containsIDR(_ nalUnits: [Data]) -> Bool {
+        nalUnits.contains { nal in
+            guard let header = nal.first else { return false }
+            return (header & 0x1F) == 5
+        }
+    }
+
+    /// Applies the awaiting-IDR gate to a completed access unit.
+    ///
+    /// While `awaitingIDR` is true, access units containing no IDR are dropped:
+    /// VideoToolbox cannot decode P-frames without a reference frame, so
+    /// submitting them produces no output and freezes the displayed frame until
+    /// the next IDR. An access unit containing an IDR clears `awaitingIDR` and
+    /// is passed through as the new reference point.
+    ///
+    /// Must be called on `queue`. Exposed internally for unit testing.
+    /// - Returns: `true` if the access unit should be submitted, `false` if it
+    ///   should be dropped.
+    func shouldSubmitAccessUnit(_ nalUnits: [Data]) -> Bool {
+        let containsIDR = Self.containsIDR(nalUnits)
+        if awaitingIDR, !containsIDR {
+            droppedWhileAwaitingIDRCount += 1
+            os_log("H264Decoder: dropping non-IDR access unit while awaiting IDR",
+                   log: log, type: .debug)
+            return false
+        }
+        if containsIDR {
+            awaitingIDR = false
+        }
+        return true
+    }
+
+    /// Re-arms the awaiting-IDR gate after a decode failure: the session may
+    /// have lost its reference frames, so subsequent non-IDR access units must
+    /// be dropped until a fresh IDR arrives.
+    ///
+    /// Must be called on `queue` — `decompressionOutputCallback` dispatches
+    /// here. Exposed internally for unit testing.
+    func recordDecodeFailure() {
+        awaitingIDR = true
     }
 
     // MARK: - Stop
@@ -510,6 +578,12 @@ private func decompressionOutputCallback(
             os_log("H264Decoder: decode callback error: %d",
                    log: OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin", category: "H264Decoder"),
                    type: .error, status)
+        }
+        // A decode failure means the session may have lost its reference
+        // frames: re-arm the IDR gate on the decoder queue so non-IDR frames
+        // are dropped until a fresh IDR arrives.
+        decoder.queue.async { [weak decoder] in
+            decoder?.recordDecodeFailure()
         }
         return
     }

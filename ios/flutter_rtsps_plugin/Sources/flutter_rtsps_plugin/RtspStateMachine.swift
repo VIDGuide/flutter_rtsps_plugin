@@ -48,6 +48,16 @@ final class RtspStateMachine {
     /// be forwarded to the `RtpDemuxer` (Defect 1.12).
     var remainingData: Data?
 
+    /// Raw interleaved RTP/RTCP frames (`$` prefix + channel + length + payload)
+    /// observed while reading RTSP responses during the handshake.
+    ///
+    /// H2-series Bambu printers start pushing RTP the moment PLAY is
+    /// acknowledged — often mid-header-line. Those frames (usually the opening
+    /// IDR) used to be drained and discarded, so the decoder could not produce a
+    /// picture until the *next* IDR (~10 s). They are collected here and
+    /// returned alongside `remainingData` so the demuxer can replay them.
+    private var capturedInterleaved = Data()
+
     private let log = OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin", category: "RtspStateMachine")
 
     // MARK: - Init
@@ -98,6 +108,9 @@ final class RtspStateMachine {
             os_log("  Public: %{public}@", log: log, type: .info, publicHeader)
         }
         logAllHeaders("OPTIONS", optionsResponse)
+        // OPTIONS is best-effort: its only use here is the Public header, and
+        // some firmware answers it with a non-2xx while still serving the
+        // stream. DESCRIBE/SETUP/PLAY below are required to be 2xx.
 
         // DESCRIBE
         let describeResponse = try await sendRequest(method: "DESCRIBE", uri: url, extraHeaders: [
@@ -106,6 +119,7 @@ final class RtspStateMachine {
         os_log("RTSP DESCRIBE %d %{public}@", log: log, type: .info,
                describeResponse.statusCode, describeResponse.reason)
         logAllHeaders("DESCRIBE", describeResponse)
+        try requireSuccess(describeResponse, method: "DESCRIBE")
         guard let sdpBody = describeResponse.body, !sdpBody.isEmpty else {
             throw RtspError.noVideoTrack
         }
@@ -129,6 +143,7 @@ final class RtspStateMachine {
             os_log("  Transport: %{public}@", log: log, type: .info, transportHeader)
         }
         logAllHeaders("SETUP", setupResponse)
+        try requireSuccess(setupResponse, method: "SETUP")
 
         if let sessionHeader = setupResponse.headers["session"] {
             os_log("  Session: %{public}@", log: log, type: .info, sessionHeader)
@@ -160,10 +175,16 @@ final class RtspStateMachine {
             os_log("  RTP-Info: %{public}@", log: log, type: .info, rtpInfo)
         }
         logAllHeaders("PLAY", playResponse)
+        try requireSuccess(playResponse, method: "PLAY")
 
         // Capture any unconsumed lookahead bytes from the last readResponse()
-        // so they can be forwarded to the RtpDemuxer (Defect 1.12).
-        let leftover = remainingData
+        // plus every interleaved RTP frame seen during the handshake, so both
+        // can be forwarded to the RtpDemuxer (Defect 1.12; opening frames).
+        var leftover = capturedInterleaved
+        if let remaining = remainingData {
+            leftover.append(contentsOf: remaining)
+        }
+        capturedInterleaved = Data()
         remainingData = nil
 
         return HandshakeResult(
@@ -310,7 +331,12 @@ final class RtspStateMachine {
                 let channelByte = lookahead[lookahead.startIndex]
 
                 if channelByte <= 1 {
-                    // Valid interleaved frame — drain channel + length + payload
+                    // Valid interleaved frame. Preserve the whole raw frame
+                    // (0x24 + channel + length + payload) so it can be replayed
+                    // into the demuxer after the handshake — H2-series printers
+                    // pipeline RTP mid-header and the opening frames carry the
+                    // IDR. These were previously drained and discarded.
+                    var frame = Data([0x24, channelByte])
                     lookahead.removeFirst() // consume channel byte
                     while lookahead.count < 2 {
                         let more = try await transport.receive(minimumLength: 1, maximumLength: 2 - lookahead.count)
@@ -318,12 +344,15 @@ final class RtspStateMachine {
                     }
                     let base = lookahead.startIndex
                     let payloadLength = Int(lookahead[base]) << 8 | Int(lookahead[base + 1])
+                    frame.append(contentsOf: lookahead.prefix(2))
                     lookahead.removeFirst(2)
 
                     if payloadLength > 0 {
                         if lookahead.count >= payloadLength {
+                            frame.append(contentsOf: lookahead.prefix(payloadLength))
                             lookahead.removeFirst(payloadLength)
                         } else {
+                            frame.append(lookahead)
                             var remaining = payloadLength - lookahead.count
                             lookahead.removeAll()
                             while remaining > 0 {
@@ -331,10 +360,12 @@ final class RtspStateMachine {
                                     minimumLength: 1,
                                     maximumLength: min(remaining, 4096)
                                 )
+                                frame.append(contentsOf: drain)
                                 remaining -= drain.count
                             }
                         }
                     }
+                    capturedInterleaved.append(frame)
                     continue
                 }
                 // Not a valid channel — fall through and treat '$' as a header byte
@@ -422,6 +453,22 @@ final class RtspStateMachine {
         }
 
         return RtspResponse(statusCode: code, reason: reason, headers: headers, body: nil)
+    }
+
+    // MARK: - Handshake validation
+
+    /// Requires a 2xx status for a handshake step.
+    ///
+    /// Only 401 was ever handled; a 4xx/5xx SETUP (e.g. 461 Unsupported
+    /// Transport) or PLAY (e.g. 455 Method Not Valid) previously fell through
+    /// as "success", and the demuxer then started on a connection that would
+    /// never carry RTP — a black frame with no error event and no reconnect.
+    private func requireSuccess(_ response: RtspResponse, method: String) throws {
+        guard (200..<300).contains(response.statusCode) else {
+            throw RtspError.connectionFailed(
+                "\(method) failed: \(response.statusCode) \(response.reason)"
+            )
+        }
     }
 
     // MARK: - Timeout

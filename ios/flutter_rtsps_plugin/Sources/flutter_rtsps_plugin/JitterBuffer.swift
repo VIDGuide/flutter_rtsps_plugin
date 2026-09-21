@@ -118,6 +118,15 @@ final class JitterBuffer {
     /// duration, resync the playout clock to recover from drift. (2 seconds)
     private static let playoutWatchdogThreshold: TimeInterval = 2.0
 
+    /// A forward raw inter-frame interval this many times larger than the
+    /// EMA-filtered interval is treated as an RTP-timestamp discontinuity
+    /// rather than transient jitter. Because `computePlayout` paces from the
+    /// raw cumulative delta since `baseRtpTimestamp`, such a jump would push
+    /// `targetWallClock` far into the future; on detection the playout clock is
+    /// rebased to the current frame immediately instead of waiting for the 2s
+    /// watchdog. (Req 2.5)
+    private static let forwardDiscontinuityFactor: Double = 4.0
+
     /// Count of consecutive frames discarded as stale. When this exceeds
     /// `staleResetThreshold`, the playout reference is reset to accept the
     /// new RTP timestamp epoch (e.g. after a server-side discontinuity).
@@ -556,8 +565,14 @@ final class JitterBuffer {
     /// Called on each timer tick. Decides whether to release the next frame.
     /// Must be called on `jitterQueue`.
     private func releaseTimerFired() {
-        let now = ProcessInfo.processInfo.systemUptime
+        releaseTimerFired(now: ProcessInfo.processInfo.systemUptime)
+    }
 
+    /// Release decision body shared by the timer and tests. `now` is the
+    /// wall-clock time used for playout pacing, injected so tests can advance
+    /// the clock deterministically without the release timer. Normally called
+    /// on `jitterQueue`; tests may call it directly.
+    func releaseTimerFired(now: TimeInterval) {
         // Acquire lock, decide what to do, release lock, then call back outside lock.
         var healthEvent: StreamHealthEvent?
         let frameToRelease: AccessUnit? = withLock {
@@ -635,7 +650,21 @@ final class JitterBuffer {
             let rawDelta = Int32(bitPattern: frame.rtpTimestamp &- lastReleasedTimestamp!)
             if rawDelta > 0 {
                 let rawInterval = Double(rawDelta) / 90000.0
-                _ = applyEMA(rawInterval: rawInterval)
+                let filteredInterval = applyEMA(rawInterval: rawInterval)
+
+                // Forward RTP-timestamp discontinuity: the raw interval is far
+                // larger than the EMA-filtered interval. Because `computePlayout`
+                // paces from the raw cumulative delta since `baseRtpTimestamp`,
+                // letting this frame through would push `targetWallClock` far
+                // into the future and freeze output until the 2s watchdog. Rebase
+                // the playout clock to this frame now so paced playout resumes
+                // immediately; the normal release path below then emits it.
+                if rawInterval > filteredInterval * Self.forwardDiscontinuityFactor {
+                    baseRtpTimestamp = frame.rtpTimestamp
+                    baseWallClock = now
+                    os_log("JitterBuffer: forward RTP discontinuity (raw=%.3fs, ema=%.3fs), rebasing playout clock",
+                           log: Self.log, type: .info, rawInterval, filteredInterval)
+                }
             }
 
             // Check if enough wall-clock time has passed since the base to release this frame.

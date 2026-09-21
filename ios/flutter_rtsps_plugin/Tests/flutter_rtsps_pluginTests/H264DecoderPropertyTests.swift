@@ -145,4 +145,146 @@ final class H264DecoderPropertyTests: XCTestCase {
             return result
         }
     }
+
+    // MARK: - Awaiting IDR Gate
+    //
+    // The gate is driven through `shouldSubmitAccessUnit` / `recordDecodeFailure`
+    // rather than by submitting real frames: producing a decodable H.264 IDR
+    // needs a full encoder, and VideoToolbox delivers its callbacks
+    // asynchronously, so a submission-driven test would be racy. The gate logic
+    // itself is pure and is exercised deterministically below.
+
+    /// Builds a single NAL unit whose header byte encodes `nalType`.
+    private static func nalUnit(nalType: UInt8, payloadSize: Int = 4) -> Data {
+        var bytes = [UInt8](repeating: 0xAB, count: max(payloadSize, 1))
+        bytes[0] = (2 << 5) | (nalType & 0x1F)
+        return Data(bytes)
+    }
+
+    /// A non-IDR access unit is dropped while the gate is armed, and the gate
+    /// stays armed.
+    func testShouldSubmitAccessUnitDropsNonIDRWhileAwaitingIDR() {
+        let decoder = H264Decoder(
+            onPixelBuffer: { _ in },
+            onError: { _ in }
+        )
+
+        decoder.queue.sync { decoder.awaitingIDR = true }
+        let nonIDR = Self.nalUnit(nalType: 1) // non-IDR coded slice
+
+        let accepted = decoder.queue.sync { decoder.shouldSubmitAccessUnit([nonIDR]) }
+
+        XCTAssertFalse(accepted, "Non-IDR access unit must be dropped while awaiting IDR")
+        XCTAssertTrue(decoder.queue.sync { decoder.awaitingIDR },
+                      "Gate must remain armed after dropping a non-IDR unit")
+        XCTAssertEqual(decoder.queue.sync { decoder.droppedWhileAwaitingIDRCount }, 1,
+                       "Drop counter must record the gated access unit")
+
+        decoder.stopSync()
+    }
+
+    /// End-to-end through `decodeAccessUnit`: a non-IDR unit is dropped by the
+    /// gate before VideoToolbox is involved, so this does not depend on a
+    /// successful decode.
+    func testDecodeAccessUnitDropsNonIDRWhileAwaitingIDR() {
+        let decoder = H264Decoder(
+            onPixelBuffer: { _ in },
+            onError: { _ in }
+        )
+
+        guard (try? decoder.initializeDecoder(sps: Self.validSps, pps: Self.validPps)) != nil else {
+            // VideoToolbox unavailable; the gate is still covered without a
+            // live session by the `shouldSubmitAccessUnit` test above.
+            return
+        }
+        XCTAssertTrue(decoder.awaitingIDR, "Initialization must arm the gate")
+
+        decoder.decodeAccessUnit([Self.nalUnit(nalType: 1)])
+        decoder.queue.sync {} // drain the decoder queue
+
+        XCTAssertTrue(decoder.awaitingIDR, "Gate must remain armed")
+        XCTAssertEqual(decoder.droppedWhileAwaitingIDRCount, 1,
+                       "Non-IDR access unit must be dropped")
+
+        decoder.stopSync()
+    }
+
+    /// An access unit containing an IDR is accepted and clears the gate.
+    func testIDRAccessUnitAcceptedAndClearsAwaitingIDR() {
+        let decoder = H264Decoder(
+            onPixelBuffer: { _ in },
+            onError: { _ in }
+        )
+
+        decoder.queue.sync { decoder.awaitingIDR = true }
+        let idr = Self.nalUnit(nalType: 5) // IDR coded slice
+
+        let accepted = decoder.queue.sync { decoder.shouldSubmitAccessUnit([idr]) }
+
+        XCTAssertTrue(accepted, "IDR access unit must be accepted")
+        XCTAssertFalse(decoder.queue.sync { decoder.awaitingIDR },
+                       "Gate must clear once an access unit containing an IDR is accepted")
+
+        decoder.stopSync()
+    }
+
+    /// A VideoToolbox decode failure re-arms the gate.
+    func testDecodeFailureReArmsAwaitingIDR() {
+        let decoder = H264Decoder(
+            onPixelBuffer: { _ in },
+            onError: { _ in }
+        )
+
+        decoder.queue.sync { decoder.awaitingIDR = false }
+        decoder.queue.sync { decoder.recordDecodeFailure() }
+
+        XCTAssertTrue(decoder.queue.sync { decoder.awaitingIDR },
+                      "A decode failure must re-arm the awaiting-IDR gate")
+
+        decoder.stopSync()
+    }
+
+    /// A freshly initialized decoder waits for an IDR before submitting frames.
+    func testInitializationArmsAwaitingIDR() {
+        let decoder = H264Decoder(
+            onPixelBuffer: { _ in },
+            onError: { _ in }
+        )
+
+        guard (try? decoder.initializeDecoder(sps: Self.validSps, pps: Self.validPps)) != nil else {
+            return
+        }
+
+        XCTAssertTrue(decoder.awaitingIDR,
+                      "A freshly initialized decoder must wait for an IDR")
+
+        decoder.stopSync()
+    }
+
+    /// A parameter-set change (reinit) re-arms the gate, even after an IDR had
+    /// cleared it.
+    func testParameterSetChangeReArmsAwaitingIDR() {
+        let decoder = H264Decoder(
+            onPixelBuffer: { _ in },
+            onError: { _ in }
+        )
+
+        guard (try? decoder.initializeDecoder(sps: Self.validSps, pps: Self.validPps)) != nil else {
+            return
+        }
+
+        // Simulate a prior IDR having cleared the gate.
+        decoder.queue.sync { decoder.awaitingIDR = false }
+
+        let differentSps = Data([
+            0x67, 0x42, 0xC0, 0x15, 0xD9, 0x00, 0x50, 0x24, 0xFE, 0xC8
+        ])
+        decoder.updateParameterSets(sps: differentSps, pps: Self.validPps)
+        decoder.queue.sync {} // drain the decoder queue
+
+        XCTAssertTrue(decoder.awaitingIDR,
+                      "A parameter-set change must re-arm the awaiting-IDR gate")
+
+        decoder.stopSync()
+    }
 }
