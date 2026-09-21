@@ -178,6 +178,18 @@ try {
 }
 ```
 
+### Concurrent stream limit
+
+The plugin serves at most `RtspStreamController.maxConcurrentStreams` (currently **8**)
+streams at once; a `startStream` beyond that fails with `RtspErrorCode.tooManyStreams`.
+That constant is the plugin's published contract — the native limit
+(`RtspStreamManager.maxStreams`) is private, so read the value from the Dart API rather
+than hardcoding it. A Dart test reads the Swift source and fails if the two drift.
+
+When multiplexing streams across many cameras, reserve capacity **before** awaiting
+`startStream` and count handshakes still in flight as well as established sessions;
+otherwise simultaneous starts race past the limit and the surplus is rejected.
+
 ## Self-signed certificate handling
 
 Bambu Lab printers expose their camera stream over TLS using a **self-signed certificate**.

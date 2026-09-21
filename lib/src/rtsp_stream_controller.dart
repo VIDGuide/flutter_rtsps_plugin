@@ -10,6 +10,21 @@ import 'rtsp_stream_event.dart';
 /// All methods delegate to the native platform via [MethodChannel] /
 /// [EventChannel].
 class RtspStreamController {
+  /// Maximum number of concurrent RTSP streams the native plugin will serve.
+  ///
+  /// This is the plugin's published contract. The native side refuses a
+  /// [startStream] once this many sessions are live, failing with
+  /// [RtspErrorCode.tooManyStreams] ("Maximum of N concurrent streams
+  /// reached"). That limit is a *private* Swift constant
+  /// (`RtspStreamManager.maxStreams`), so read it from here rather than
+  /// hardcoding it.
+  ///
+  /// Callers that multiplex streams across many cameras must reserve capacity
+  /// *before* awaiting [startStream], and must count handshakes still in flight
+  /// as well as established sessions — otherwise simultaneous starts race past
+  /// the limit and the surplus is rejected.
+  static const int maxConcurrentStreams = 8;
+
   RtspStreamController()
       : _methodChannel =
             const MethodChannel('flutter_rtsps_plugin/methods');
