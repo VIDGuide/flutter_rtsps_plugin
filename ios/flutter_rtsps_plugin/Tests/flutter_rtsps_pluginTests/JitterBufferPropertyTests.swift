@@ -672,6 +672,46 @@ final class JitterBufferPropertyTests: XCTestCase {
         }
     }
 
+    // MARK: - Forward RTP-Timestamp Discontinuity Recovery
+
+    /// A forward jump in RTP timestamps that is far larger than the
+    /// EMA-filtered frame interval must rebase the playout clock immediately
+    /// instead of letting the raw cumulative delta hold the frame until the
+    /// 2s playout watchdog.
+    func testForwardTimestampDiscontinuityRebasesPlayout() {
+        let config = JitterBufferConfig(bufferDepthMs: 50, transportMode: .tcp)
+        let jb = JitterBuffer(config: config)
+
+        var releasedTimestamps: [UInt32] = []
+        jb.onReleaseFrame = { releasedTimestamps.append($0.rtpTimestamp) }
+
+        // Frame 0 establishes the base; 3000/6000 form a steady ~33ms
+        // cadence; the final frame jumps ~1.93s forward.
+        let timestamps: [UInt32] = [0, 3000, 6000, 180_000]
+        for (i, ts) in timestamps.enumerated() {
+            jb.enqueue(Self.makeAccessUnit(
+                rtpTimestamp: ts,
+                sequenceNumber: UInt16(truncatingIfNeeded: i)
+            ))
+        }
+
+        // A wall clock past the initial buffering period.
+        let t0 = ProcessInfo.processInfo.systemUptime + 1.0
+
+        // Release the base frame, then the two steady frames at their
+        // RTP-scheduled times (t0 + 3000/90000 and t0 + 6000/90000).
+        jb.releaseTimerFired(now: t0)
+        jb.releaseTimerFired(now: t0 + 0.04)
+        jb.releaseTimerFired(now: t0 + 0.08)
+        XCTAssertEqual(releasedTimestamps, [0, 3000, 6000])
+
+        // The jump frame's raw cumulative offset from the base is 2.0s, so
+        // without a rebase it would be withheld until the 2s watchdog. The
+        // EMA flags the outlier, so it must be released now.
+        jb.releaseTimerFired(now: t0 + 0.10)
+        XCTAssertEqual(releasedTimestamps, [0, 3000, 6000, 180_000])
+    }
+
     // MARK: - Property 16: Diagnostics Stats Consistency
     // **Validates: Requirements 10.1, 10.2, 14.1, 14.2**
 

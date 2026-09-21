@@ -64,6 +64,19 @@ class RtspStreamManager: @unchecked Sendable {
                 binaryMessenger: self.binaryMessenger
             )
             self.sessions[streamId] = session
+            // Drop the session from the map whenever it tears itself down
+            // (RTCP/decoder error, stall watchdog, or an explicit stop). Before
+            // this, only stopStream() and a failed start() removed entries, so a
+            // self-terminated session kept a slot in the 8-stream cap forever
+            // and later starts failed with tooManyStreams.
+            session.onStopped = { [weak self] in
+                guard let self else { return }
+                self.queue.async {
+                    if self.sessions.removeValue(forKey: streamId) != nil {
+                        self.log("startStream: session \(streamId) torn down; removed (count=\(self.sessions.count))")
+                    }
+                }
+            }
             self.log("startStream: created session streamId=\(streamId)")
 
             // Store the Task so stopStream can cancel an in-flight start (Defect 1.7)
@@ -82,6 +95,11 @@ class RtspStreamManager: @unchecked Sendable {
                     DispatchQueue.main.async {
                         result(flutterError)
                     }
+                    // Release whatever start() had already created (event
+                    // channel, Flutter texture, decoder, NWConnection).
+                    // Removing the map entry alone leaked all of it on every
+                    // failed start.
+                    await session.stop()
                     throw error
                 }
             }
@@ -187,8 +205,13 @@ class RtspStreamManager: @unchecked Sendable {
     /// Stops all sessions without a FlutterResult callback.
     /// Called from `detachFromEngine`.
     func disposeAll() {
-        queue.async { [weak self] in
-            guard let self else { return }
+        // Capture self strongly. `detachFromEngine` calls this and then
+        // immediately drops its reference; with `[weak self]` the manager was
+        // deallocated before this block ran, the guard returned, and every
+        // session leaked (sockets, decoders and textures alive for the app's
+        // lifetime — there is no deinit fallback).
+        queue.async {
+            self.log("disposeAll: stopping all \(self.sessions.count) sessions")
             let allSessions = Array(self.sessions.values)
             self.sessions.removeAll()
             Task {

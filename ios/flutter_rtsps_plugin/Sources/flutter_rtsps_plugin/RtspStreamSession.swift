@@ -56,6 +56,33 @@ final class RtspStreamSession: NSObject {
     /// to abort an in-flight connection attempt (Defect 1.7).
     var startTask: Task<Int, Error>?
 
+    /// Invoked exactly once, when this session finishes tearing itself down.
+    ///
+    /// `RtspStreamManager` sets this to drop the session from its `sessions`
+    /// map. Without it a session that tears down on its own — an RTCP or decoder
+    /// error, or the RTP-stall watchdog below — stayed in the map forever and
+    /// permanently consumed one of the 8 stream slots, so later starts failed
+    /// with `tooManyStreams`.
+    var onStopped: (() -> Void)?
+
+    /// Protected by `stateQueue`. Set once so teardown cannot notify twice.
+    private var notifiedStopped = false
+
+    /// Last time an RTP packet arrived. Guarded by `watchdogQueue`.
+    private var lastRtpArrival: Date?
+
+    /// If RTP stops arriving while the session is live, treat it as a stall and
+    /// fail the session so the manager can reconnect. `RtspTransport.onDisconnect`
+    /// only fires on a hard `.failed`/`.cancelled` state, so a half-open TCP
+    /// stall (peer stops sending but keeps the socket — the failure mode this
+    /// plugin exists to survive) was previously invisible until the 5-minute
+    /// periodic reconnect.
+    private static let rtpStallThreshold: TimeInterval = 15
+    private var rtpWatchdog: DispatchSourceTimer?
+    private let watchdogQueue = DispatchQueue(
+        label: "com.pandawatch.flutter_rtsps_plugin.session.watchdog.\(arc4random())"
+    )
+
     private let log = OSLog(subsystem: "com.pandawatch.flutter_rtsps_plugin", category: "RtspStreamSession")
 
     // MARK: - Init
@@ -105,6 +132,12 @@ final class RtspStreamSession: NSObject {
 
         // Build transport + state machine
         let transport = RtspTransport()
+        // A post-connection transport failure must tear the session down. The
+        // onDisconnect hook existed on RtspTransport but was never assigned, so
+        // a hard connection drop went unnoticed.
+        transport.onDisconnect = { [weak self] error in
+            self?.handleError(error)
+        }
         self.transport = transport
 
         guard let sm = try? RtspStateMachine(
@@ -204,8 +237,9 @@ final class RtspStreamSession: NSObject {
         demux.onRtcpPacket = { [weak rtcp] data in
             rtcp?.processRtcpPacket(data)
         }
-        demux.onRtpStats = { [weak rtcp] stats in
+        demux.onRtpStats = { [weak self, weak rtcp] stats in
             rtcp?.updateStats(stats)
+            self?.noteRtpArrival()
         }
         self.demuxer = demux
         self.assembler = asm
@@ -232,6 +266,9 @@ final class RtspStreamSession: NSObject {
         }
         rm.start()
         self.reconnectionManager = rm
+
+        // The pipeline is live: start watching for RTP going silent.
+        startRtpWatchdog()
 
         // SDP diagnostic logging (Req 11.1, 11.2)
         os_log("RtspStreamSession[%d]: SDP summary — codec: H264, control: %{public}@, SPS/PPS: %{public}@, transport: TCP",
@@ -296,6 +333,9 @@ final class RtspStreamSession: NSObject {
         // 1. Stop ReconnectionManager first (prevents new reconnection during teardown)
         reconnectionManager?.stop()
 
+        // 1b. Stop the RTP stall watchdog so it cannot fire mid-teardown
+        stopRtpWatchdog()
+
         // 2. Stop JitterBuffer release timer
         jitterBuffer?.stop()
 
@@ -336,26 +376,34 @@ final class RtspStreamSession: NSObject {
             eventChannel?.setStreamHandler(nil)
             eventChannel = nil
         }
+
+        // 11. Tell the manager this session is gone even when teardown was
+        // self-initiated (handleError / stall watchdog) rather than a Dart
+        // stopStream. Otherwise the dead session keeps a stream slot forever.
+        notifyStoppedOnce()
     }
 
     // MARK: - Private — reconnection (Req 7.1, 7.2, 7.3, 7.4)
 
-    /// Performs a full pipeline swap: detaches old assembler, creates new
-    /// transport/handshake/demuxer/assembler, resets jitter buffer, wires
-    /// new assembler, and tears down old pipeline.
+    /// Performs a full pipeline swap for the periodic Live555-hang workaround.
+    ///
+    /// The replacement transport/handshake is built and connected **first**, and
+    /// the live pipeline is only detached once the new one is up. Previously the
+    /// old assembler was detached up front, so a failed connect/handshake froze
+    /// a healthy stream until a later backoff attempt succeeded — and leaked the
+    /// new NWConnection on every failure. A teardown that races this method no
+    /// longer resurrects a session the manager has already forgotten.
     private func performReconnection() async throws {
+        let stoppedBefore: Bool = stateQueue.sync { stopped }
+        guard !stoppedBefore else {
+            os_log("RtspStreamSession[%d]: reconnection skipped — session stopped",
+                   log: log, type: .info, streamId)
+            return
+        }
+
         os_log("RtspStreamSession[%d]: reconnection starting", log: log, type: .info, streamId)
 
-        // Detach old assembler so it stops feeding the jitter buffer
-        let oldAssembler = assembler
-        oldAssembler?.onAccessUnit = nil
-
-        let oldDemuxer = demuxer
-        let oldTransport = transport
-        let oldStateMachine = stateMachine
-        let oldRtcpSender = rtcpSender
-
-        // Build new transport + state machine
+        // Build the replacement first; the existing pipeline keeps running.
         let newTransport = RtspTransport()
 
         guard let newSm = try? RtspStateMachine(
@@ -367,92 +415,122 @@ final class RtspStreamSession: NSObject {
             throw RtspError.connectionFailed("Invalid RTSP URL during reconnection")
         }
 
-        // Connect new transport
         guard let parsed = URL(string: url), let host = parsed.host else {
             throw RtspError.connectionFailed("Invalid RTSP URL during reconnection")
         }
         let defaultPort = parsed.scheme?.lowercased() == "rtsps" ? 322 : 554
         let port = UInt16(parsed.port ?? defaultPort)
-        try await newTransport.connect(host: host, port: port)
 
-        // Run handshake on new connection — TCP interleaved only (same as start())
-        let handshakeResult = try await newSm.runHandshake()
-        let videoTrack = handshakeResult.videoTrack
+        do {
+            try await newTransport.connect(host: host, port: port)
 
-        // Initialize decoder with new SPS/PPS if available
-        if let sps = videoTrack.sps, let pps = videoTrack.pps {
-            decoder?.updateParameterSets(sps: sps, pps: pps)
-        }
+            // Run handshake on new connection — TCP interleaved only (same as start())
+            let handshakeResult = try await newSm.runHandshake()
+            let videoTrack = handshakeResult.videoTrack
 
-        // Create new RTCP sender
-        let newRtcp = RtcpSender(transport: newTransport) { [weak self] error in
-            self?.handleError(error)
-        }
-
-        // Create new demuxer
-        let newDemux = RtpDemuxer(transport: newTransport)
-
-        // Create new assembler
-        let newAsm = AccessUnitAssembler()
-
-        // Wire new pipeline
-        newDemux.onNalUnit = { [weak newAsm] unit in
-            newAsm?.feedNalUnit(unit)
-        }
-
-        // Reset jitter buffer at the swap point (flush stale frames)
-        jitterBuffer?.reset()
-
-        // Wire new assembler to existing jitter buffer
-        let jb = jitterBuffer
-        let dec = decoder
-        newAsm.onAccessUnit = { [weak jb] accessUnit in
-            jb?.enqueue(accessUnit)
-        }
-        var pendingSps: Data?
-        var pendingPps: Data?
-        newAsm.onParameterSet = { [weak dec] data, nalType in
-            switch nalType {
-            case 7: pendingSps = data
-            case 8: pendingPps = data
-            default: break
+            // A teardown may have run while we were connecting.
+            let stoppedDuring: Bool = stateQueue.sync { stopped }
+            guard !stoppedDuring else {
+                os_log("RtspStreamSession[%d]: reconnection abandoned — session stopped mid-flight",
+                       log: log, type: .info, streamId)
+                newTransport.close()
+                return
             }
-            if let sps = pendingSps, let pps = pendingPps {
-                dec?.updateParameterSets(sps: sps, pps: pps)
-                pendingSps = nil
-                pendingPps = nil
+
+            // Initialize decoder with new SPS/PPS if available
+            if let sps = videoTrack.sps, let pps = videoTrack.pps {
+                decoder?.updateParameterSets(sps: sps, pps: pps)
             }
+
+            // Create new RTCP sender
+            let newRtcp = RtcpSender(transport: newTransport) { [weak self] error in
+                self?.handleError(error)
+            }
+
+            // Create new demuxer
+            let newDemux = RtpDemuxer(transport: newTransport)
+
+            // Create new assembler
+            let newAsm = AccessUnitAssembler()
+
+            // Wire new pipeline
+            newDemux.onNalUnit = { [weak newAsm] unit in
+                newAsm?.feedNalUnit(unit)
+            }
+
+            // Reset jitter buffer at the swap point (flush stale frames)
+            jitterBuffer?.reset()
+
+            // Wire new assembler to existing jitter buffer
+            let jb = jitterBuffer
+            let dec = decoder
+            newAsm.onAccessUnit = { [weak jb] accessUnit in
+                jb?.enqueue(accessUnit)
+            }
+            var pendingSps: Data?
+            var pendingPps: Data?
+            newAsm.onParameterSet = { [weak dec] data, nalType in
+                switch nalType {
+                case 7: pendingSps = data
+                case 8: pendingPps = data
+                default: break
+                }
+                if let sps = pendingSps, let pps = pendingPps {
+                    dec?.updateParameterSets(sps: sps, pps: pps)
+                    pendingSps = nil
+                    pendingPps = nil
+                }
+            }
+
+            newDemux.onRtcpPacket = { [weak newRtcp] data in
+                newRtcp?.processRtcpPacket(data)
+            }
+            newDemux.onRtpStats = { [weak self, weak newRtcp] stats in
+                newRtcp?.updateStats(stats)
+                self?.noteRtpArrival()
+            }
+
+            if let leftover = handshakeResult.remainingData {
+                newDemux.seedData(leftover)
+            }
+            newDemux.start()
+
+            newRtcp.start()
+
+            // The replacement is live — commit the swap, then retire the old
+            // pipeline. Only now is it safe to detach the old assembler.
+            let oldAssembler = assembler
+            let oldDemuxer = demuxer
+            let oldTransport = transport
+            let oldStateMachine = stateMachine
+            let oldRtcpSender = rtcpSender
+
+            self.transport = newTransport
+            self.stateMachine = newSm
+            self.demuxer = newDemux
+            self.rtcpSender = newRtcp
+            self.assembler = newAsm
+
+            oldAssembler?.onAccessUnit = nil
+            oldRtcpSender?.stop()
+            oldDemuxer?.stop()
+            oldAssembler?.flush()
+            await oldStateMachine?.teardown()
+            oldTransport?.close()
+
+            // Fresh pipeline, fresh liveness baseline for the stall watchdog.
+            watchdogQueue.async { [weak self] in
+                self?.lastRtpArrival = nil
+            }
+            startRtpWatchdog()
+
+            os_log("RtspStreamSession[%d]: reconnection complete", log: log, type: .info, streamId)
+        } catch {
+            // Release the half-built replacement connection. Every failed
+            // reconnect previously leaked an NWConnection.
+            newTransport.close()
+            throw error
         }
-
-        newDemux.onRtcpPacket = { [weak newRtcp] data in
-            newRtcp?.processRtcpPacket(data)
-        }
-        newDemux.onRtpStats = { [weak newRtcp] stats in
-            newRtcp?.updateStats(stats)
-        }
-
-        if let leftover = handshakeResult.remainingData {
-            newDemux.seedData(leftover)
-        }
-        newDemux.start()
-
-        newRtcp.start()
-
-        // Swap references
-        self.transport = newTransport
-        self.stateMachine = newSm
-        self.demuxer = newDemux
-        self.rtcpSender = newRtcp
-        self.assembler = newAsm
-
-        // Tear down old pipeline
-        oldRtcpSender?.stop()
-        oldDemuxer?.stop()
-        oldAssembler?.flush()
-        await oldStateMachine?.teardown()
-        oldTransport?.close()
-
-        os_log("RtspStreamSession[%d]: reconnection complete", log: log, type: .info, streamId)
     }
 
     // MARK: - Private — first frame
@@ -509,6 +587,75 @@ final class RtspStreamSession: NSObject {
             self.emitEvent(["type": "stopped"])
             os_log("RtspStreamSession[%d]: stopped (from handleError)", log: self.log, type: .info, self.streamId)
         }
+    }
+
+    // MARK: - Private — teardown notification
+
+    /// Notifies `onStopped` at most once, whichever teardown path (Dart
+    /// stopStream, handleError, or the stall watchdog) reached performStop first.
+    private func notifyStoppedOnce() {
+        let shouldNotify: Bool = stateQueue.sync {
+            if notifiedStopped { return false }
+            notifiedStopped = true
+            return true
+        }
+        if shouldNotify {
+            onStopped?()
+        }
+    }
+
+    // MARK: - Private — RTP stall watchdog
+
+    private func startRtpWatchdog() {
+        let t = DispatchSource.makeTimerSource(queue: watchdogQueue)
+        t.schedule(
+            deadline: .now() + Self.rtpStallThreshold,
+            repeating: Self.rtpStallThreshold / 3,
+            leeway: .seconds(1)
+        )
+        t.setEventHandler { [weak self] in
+            self?.checkRtpWatchdog()
+        }
+        t.resume()
+
+        let previous: DispatchSourceTimer? = watchdogQueue.sync {
+            let old = rtpWatchdog
+            rtpWatchdog = t
+            return old
+        }
+        previous?.cancel()
+    }
+
+    private func stopRtpWatchdog() {
+        let previous: DispatchSourceTimer? = watchdogQueue.sync {
+            let old = rtpWatchdog
+            rtpWatchdog = nil
+            return old
+        }
+        previous?.cancel()
+    }
+
+    /// Records RTP liveness from the demuxer's per-packet stats callback, so it
+    /// tracks raw packet arrival rather than decoded frames. Runs on
+    /// `watchdogQueue` only to keep this off the hot `stateQueue`.
+    private func noteRtpArrival() {
+        watchdogQueue.async { [weak self] in
+            self?.lastRtpArrival = Date()
+        }
+    }
+
+    /// Runs on `watchdogQueue` (the timer's queue).
+    private func checkRtpWatchdog() {
+        let isStopped = stateQueue.sync { stopped }
+        guard !isStopped, let last = lastRtpArrival else { return }
+        guard Date().timeIntervalSince(last) >= Self.rtpStallThreshold else { return }
+
+        // Disarm until RTP resumes so a slow teardown cannot re-trigger.
+        lastRtpArrival = nil
+
+        os_log("RtspStreamSession[%d]: no RTP for %.0fs — treating stream as stalled",
+               log: log, type: .error, streamId, Self.rtpStallThreshold)
+        handleError(RtspError.timeout)
     }
 
     // MARK: - Private — event emission
