@@ -72,15 +72,28 @@ final class ReconnectionManager {
         t.setEventHandler { [weak self] in
             self?.performReconnection()
         }
+        // `timer` is otherwise only touched on `reconnectQueue`; `start()` runs
+        // off-queue (session setup), so assign the new source on-queue to keep
+        // it serialized against a concurrent `stop()` and avoid over-releasing
+        // the DispatchSourceTimer (same class of bug as GLITCHTIP #155).
+        reconnectQueue.sync {
+            self.timer?.cancel()
+            self.timer = t
+        }
         t.resume()
-        timer = t
         os_log("ReconnectionManager: started (interval=%.0fs)", log: log, type: .info, reconnectInterval)
     }
 
     /// Stop the timer and cancel any pending reconnection. (Req 7.8)
+    ///
+    /// Callers are off-queue (`start()` itself, and
+    /// `RtspStreamSession.performStop()`), so the teardown is serialized onto
+    /// `reconnectQueue` via `sync`, mirroring `JitterBuffer.stop()`.
     func stop() {
-        timer?.cancel()
-        timer = nil
+        reconnectQueue.sync {
+            self.timer?.cancel()
+            self.timer = nil
+        }
     }
 
     // MARK: - Reconnection Logic

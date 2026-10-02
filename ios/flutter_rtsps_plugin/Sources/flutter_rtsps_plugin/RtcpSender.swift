@@ -249,22 +249,47 @@ final class RtcpSender {
     ///   `min(1.0, timeout / 3)` so the keepalive fires well within the
     ///   server's expiry window (Req 2.14).
     func start(interval: TimeInterval = 1.0) {
+        // `timer` is only ever read/written on `timerQueue` (the queue the
+        // dispatch source fires on, and the queue `rescheduleTimer` mutates it
+        // on). `start()` is always called off-queue (session/snapshot setup),
+        // so hop onto `timerQueue` to assign the new source — otherwise this
+        // write races a concurrent `rescheduleTimer`/`stop` on the source and
+        // over-releases it (OS_dispatch_source cast crash, GLITCHTIP #155).
         normalInterval = interval
         let t = DispatchSource.makeTimerSource(queue: timerQueue)
         t.schedule(deadline: .now() + interval, repeating: interval)
         t.setEventHandler { [weak self] in
             self?.timerFired()
         }
+        timerQueue.sync {
+            // Cancel any prior source before replacing it, mirroring stop().
+            self.timer?.cancel()
+            self.timer = t
+        }
         t.resume()
-        timer = t
         os_log("RtcpSender: started (interval=%.2fs)", log: log, type: .info, interval)
     }
 
     /// Cancels the timer immediately. Safe to call multiple times. (Req 3.3)
+    ///
+    /// All callers are off-queue (`SnapshotCapture.capture()`'s `defer`,
+    /// `RtspStreamSession.performStop()`, the reconnection swap, and
+    /// `sendReceiverReport()`'s error `Task`), so the teardown is serialized
+    /// onto `timerQueue` via `sync`. This closes the data race with the
+    /// on-queue `rescheduleTimer()`/`timerFired()` that previously double-
+    /// cancelled / over-released the `DispatchSourceTimer` (GLITCHTIP #155).
     func stop() {
+        timerQueue.sync {
+            self.tearDownTimerOnQueue()
+        }
+        os_log("RtcpSender: stopped", log: log, type: .info)
+    }
+
+    /// Cancels and clears the timer. **Must be called on `timerQueue`.**
+    private func tearDownTimerOnQueue() {
+        dispatchPrecondition(condition: .onQueue(timerQueue))
         timer?.cancel()
         timer = nil
-        os_log("RtcpSender: stopped", log: log, type: .info)
     }
 
     // MARK: - Timer Logic
@@ -293,6 +318,7 @@ final class RtcpSender {
     /// Replaces the current timer with one at the new interval.
     /// Must be called on `timerQueue`.
     private func rescheduleTimer(interval: TimeInterval) {
+        dispatchPrecondition(condition: .onQueue(timerQueue))
         timer?.cancel()
         let t = DispatchSource.makeTimerSource(queue: timerQueue)
         t.schedule(deadline: .now() + interval, repeating: interval)
